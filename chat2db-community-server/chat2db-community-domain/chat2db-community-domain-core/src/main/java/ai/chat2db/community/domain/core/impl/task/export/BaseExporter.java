@@ -1,0 +1,261 @@
+package ai.chat2db.community.domain.core.impl.task.export;
+
+import ai.chat2db.community.domain.api.model.task.ExportTaskSpec;
+import ai.chat2db.community.domain.api.model.task.TaskCancelledException;
+import ai.chat2db.community.domain.api.model.task.TaskConstants;
+import ai.chat2db.community.domain.api.model.task.TaskErrorCode;
+import ai.chat2db.community.domain.api.model.task.TaskEventCode;
+import ai.chat2db.community.domain.api.model.task.TaskExecutionException;
+import ai.chat2db.community.domain.api.model.task.TaskStage;
+import ai.chat2db.community.domain.api.model.task.extension.ExportCell;
+import ai.chat2db.community.domain.api.model.task.extension.ExportCellContext;
+import ai.chat2db.community.domain.api.model.sql.extension.SqlExecutionContext;
+import ai.chat2db.community.domain.api.model.sql.extension.SqlExecutionOperation;
+import ai.chat2db.community.domain.api.model.sql.extension.SqlExecutionPlan;
+import ai.chat2db.community.domain.api.model.sql.extension.SqlResultColumnContext;
+import ai.chat2db.community.domain.api.service.task.TaskExecutionContext;
+import ai.chat2db.community.domain.core.impl.db.extension.SqlExecutionPolicyManager;
+import ai.chat2db.spi.model.datasource.ConnectInfo;
+import ai.chat2db.spi.model.value.JDBCDataValue;
+import ai.chat2db.spi.sql.Chat2DBContext;
+import cn.hutool.core.io.FileUtil;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.collections4.CollectionUtils;
+import org.apache.commons.lang3.StringUtils;
+
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
+import java.io.File;
+import java.io.IOException;
+import java.io.InputStream;
+import java.nio.file.Files;
+import java.sql.ResultSet;
+import java.sql.ResultSetMetaData;
+import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
+
+
+@Slf4j
+public abstract class BaseExporter implements IExportStrategy {
+
+    private final ExportCellProcessorChain exportCellProcessorChain;
+
+    private final SqlExecutionPolicyManager sqlExecutionPolicyManager;
+
+    protected String contentType;
+
+    protected String suffix;
+    public static int BATCH_SIZE = 1000;
+
+    protected BaseExporter(ExportCellProcessorChain exportCellProcessorChain,
+            SqlExecutionPolicyManager sqlExecutionPolicyManager) {
+        this.exportCellProcessorChain = exportCellProcessorChain;
+        this.sqlExecutionPolicyManager = sqlExecutionPolicyManager;
+    }
+
+    @Override
+    public void run(ExportTaskSpec spec, TaskExecutionContext context, File outputFile) {
+        context.checkCancelled();
+        List<String> tableNames = spec.getTableNames();
+        if (CollectionUtils.isEmpty(tableNames)) {
+            throw new IllegalArgumentException("tableNames should not be null or empty");
+        }
+        try {
+            // The executor already moved the task to 10; the reporter carries that value until the
+            // first stage boundary so counter-only updates never regress the task.
+            ExportProgressReporter progressReporter = new ExportProgressReporter(context, 10);
+            if (tableNames.size() == 1) {
+                progressReporter.stage(20, TaskStage.EXPORTING.name(), "Exporting table data");
+                single(spec, context, outputFile, 0, 1, progressReporter);
+            } else {
+                multi(spec, context, outputFile, progressReporter);
+            }
+        } catch (TaskCancelledException | TaskExecutionException e) {
+            throw e;
+        } catch (Exception e) {
+            log.error("export data error", e);
+            throw new TaskExecutionException(TaskErrorCode.EXPORT_FAILED.name(), "Could not export table data", e);
+        }
+    }
+
+    private void single(ExportTaskSpec spec, TaskExecutionContext context, File outputFile, int tableIndex,
+            int totalTables, ExportProgressReporter progressReporter) throws Exception {
+        String tableName = spec.getTableNames().get(0);
+        logTableEvent(context, TaskEventCode.TABLE_EXPORT_STARTED.name(),
+                tableProgressMessage("Exporting table", tableName, tableIndex, totalTables), tableName,
+                tableIndex, totalTables);
+        singleExport(spec, context, tableName, outputFile, progressReporter);
+        logTableEvent(context, TaskEventCode.TABLE_EXPORT_COMPLETED.name(),
+                tableProgressMessage("Table export completed", tableName, tableIndex, totalTables), tableName,
+                tableIndex, totalTables);
+    }
+
+    private void multi(ExportTaskSpec spec, TaskExecutionContext context, File outputFile,
+            ExportProgressReporter progressReporter) throws Exception {
+        File parent = outputFile.getAbsoluteFile().getParentFile();
+        FileUtil.mkdir(parent);
+        File temporaryDirectory = Files.createTempDirectory(parent.toPath(), ".task-export-").toFile();
+        int n = spec.getTableNames().size();
+        List<File> intermediateFiles = new ArrayList<>(n);
+        try {
+            for (int i = 0; i < n; i++) {
+                context.checkCancelled();
+                String tableName = spec.getTableNames().get(i);
+                if (StringUtils.isEmpty(tableName)) {
+                    throw new IllegalArgumentException("tableName should not be null or empty");
+                }
+                String safeTableName = new File(tableName).getName();
+                File file = new File(temporaryDirectory, safeTableName + suffix);
+                intermediateFiles.add(file);
+                logTableEvent(context, TaskEventCode.TABLE_EXPORT_STARTED.name(),
+                        tableProgressMessage("Exporting table", tableName, i, n), tableName, i, n);
+                singleExport(spec, context, tableName, file, progressReporter);
+                logTableEvent(context, TaskEventCode.TABLE_EXPORT_COMPLETED.name(),
+                        tableProgressMessage("Table export completed", tableName, i, n), tableName, i, n);
+                progressReporter.stage(Math.min(90, 10 + ((i + 1) * 80 / n)), TaskStage.EXPORTING.name(),
+                        "Exported " + (i + 1) + " of " + n + " tables");
+            }
+            context.checkCancelled();
+            progressReporter.stage(92, TaskStage.FINALIZING.name(), "Finalizing ZIP export archive");
+            context.logInfo(TaskEventCode.FILE_FINALIZING.name(), "Finalizing ZIP export archive",
+                    Map.of(TaskConstants.FILE_FORMAT_DETAIL_KEY, "ZIP",
+                            TaskConstants.TOTAL_TABLES_DETAIL_KEY, n));
+            zip(context, outputFile, intermediateFiles);
+        } finally {
+            for (File file : intermediateFiles) {
+                FileUtil.del(file);
+            }
+            FileUtil.del(temporaryDirectory);
+        }
+    }
+
+    private void zip(TaskExecutionContext context, File outputFile, List<File> files) throws IOException {
+        byte[] buffer = new byte[8192];
+        try (ZipOutputStream output = new ZipOutputStream(
+                new BufferedOutputStream(Files.newOutputStream(outputFile.toPath())))) {
+            for (File file : files) {
+                context.checkCancelled();
+                output.putNextEntry(new ZipEntry(file.getName()));
+                try (InputStream input = new BufferedInputStream(Files.newInputStream(file.toPath()))) {
+                    int length;
+                    while ((length = input.read(buffer)) != -1) {
+                        context.checkCancelled();
+                        output.write(buffer, 0, length);
+                    }
+                } finally {
+                    output.closeEntry();
+                }
+            }
+        }
+    }
+
+    protected String getQuerySql(ExportTaskSpec spec, String tableName) {
+        String databaseName = spec.getTarget().getDatabaseName();
+        String schemaName = spec.getTarget().getSchemaName();
+        return Chat2DBContext.getSqlBuilder().dql().buildSelectTable(databaseName, schemaName, tableName);
+    }
+
+    protected SqlExecutionPlan getQueryPlan(ExportTaskSpec spec, String tableName) {
+        String querySql = getQuerySql(spec, tableName);
+        ConnectInfo connectInfo = Chat2DBContext.getConnectInfo();
+        SqlExecutionContext context = new SqlExecutionContext(
+                spec.getTarget().getDataSourceId(),
+                connectInfo == null ? null : connectInfo.getDbType(),
+                spec.getTarget().getDatabaseName(),
+                spec.getTarget().getSchemaName(),
+                tableName, querySql, SqlExecutionOperation.EXPORT, type());
+        SqlExecutionPlan plan = sqlExecutionPolicyManager.plan(context);
+        sqlExecutionPolicyManager.beforeExecute(plan);
+        return plan;
+    }
+
+    protected boolean nextRow(ResultSet resultSet, SqlExecutionPlan plan, int exportedRowCount)
+            throws SQLException {
+        if (!sqlExecutionPolicyManager.isRowAllowed(plan, exportedRowCount)) {
+            return false;
+        }
+        if (exportedRowCount > 0 && exportedRowCount % BATCH_SIZE == 0) {
+            sqlExecutionPolicyManager.checkpoint(plan);
+        }
+        return resultSet.next();
+    }
+
+    protected ExportCell processJdbcCell(ExportTaskSpec spec, ResultSetMetaData metaData, int columnIndex,
+            String tableName, JDBCDataValue jdbcDataValue) throws SQLException {
+        Object value = jdbcDataValue.getObject();
+        if (value == null) {
+            value = jdbcDataValue.getStringValue();
+        }
+        ExportCell cell = new ExportCell(value, metaData.getColumnType(columnIndex),
+                metaData.getColumnTypeName(columnIndex), metaData.getPrecision(columnIndex),
+                metaData.getScale(columnIndex));
+        ConnectInfo connectInfo = Chat2DBContext.getConnectInfo();
+        ExportCellContext cellContext = new ExportCellContext(
+                spec.getTarget().getDataSourceId(),
+                connectInfo == null ? null : connectInfo.getDbType(),
+                spec.getTarget().getDatabaseName(),
+                spec.getTarget().getSchemaName(),
+                tableName, metaData.getColumnName(columnIndex), type());
+        return exportCellProcessorChain.process(cellContext, cell);
+    }
+
+    protected List<Integer> includedColumnIndexes(ResultSetMetaData metaData, SqlExecutionPlan plan)
+            throws SQLException {
+        int columnCount = metaData.getColumnCount();
+        List<Integer> includedIndexes = new ArrayList<>(columnCount);
+        if (sqlExecutionPolicyManager.isEmpty()) {
+            for (int index = 1; index <= columnCount; index++) {
+                includedIndexes.add(index);
+            }
+            return includedIndexes;
+        }
+        SqlExecutionContext executionContext = plan.getContext();
+        for (int index = 1; index <= columnCount; index++) {
+            String resultTableName = StringUtils.defaultIfBlank(metaData.getTableName(index),
+                    executionContext.getTableName());
+            SqlResultColumnContext columnContext = new SqlResultColumnContext(plan, index,
+                    metaData.getColumnName(index), metaData.getColumnLabel(index), metaData.getColumnType(index),
+                    metaData.getColumnTypeName(index), executionContext.getDatabaseName(),
+                    executionContext.getSchemaName(), resultTableName, false);
+            if (sqlExecutionPolicyManager.includeColumn(columnContext)) {
+                includedIndexes.add(index);
+            }
+        }
+        return includedIndexes;
+    }
+
+    protected <T> List<T> selectColumns(List<T> values, List<Integer> includedColumnIndexes) {
+        List<T> selected = new ArrayList<>(includedColumnIndexes.size());
+        for (Integer columnIndex : includedColumnIndexes) {
+            int listIndex = columnIndex - 1;
+            if (listIndex >= 0 && listIndex < values.size()) {
+                selected.add(values.get(listIndex));
+            }
+        }
+        return selected;
+    }
+
+    protected boolean hasExportCellProcessors() {
+        return !exportCellProcessorChain.isEmpty();
+    }
+
+    private String tableProgressMessage(String prefix, String tableName, int tableIndex, int totalTables) {
+        return prefix + " " + (tableIndex + 1) + "/" + totalTables + ": " + tableName;
+    }
+
+    private void logTableEvent(TaskExecutionContext context, String code, String message, String tableName,
+            int tableIndex, int totalTables) {
+        context.logInfo(code, message,
+                Map.of(TaskConstants.TABLE_NAME_DETAIL_KEY, tableName,
+                        TaskConstants.EXPORTED_TABLES_DETAIL_KEY, tableIndex + 1,
+                        TaskConstants.TOTAL_TABLES_DETAIL_KEY, totalTables));
+    }
+
+    protected abstract void singleExport(ExportTaskSpec spec, TaskExecutionContext context, String tableName,
+            File file, ExportProgressReporter progressReporter) throws Exception;
+
+}

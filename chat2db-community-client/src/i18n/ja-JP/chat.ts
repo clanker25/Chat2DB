@@ -1,0 +1,31 @@
+export default {
+  'chat.input.remain': '{1} 残り',
+  'chat.input.tableSelect.placeholder': 'テーブルを選択してください',
+  'chat.input.tableSelect.error.TooManyTable': 'テーブルは最大8つまで選択できます',
+  'chat.input.remain.dialog.tips':
+    '公式のWeChatアカウントを購読し、推進を送信して、より多くの体験の機会を得る。',
+  'chat.input.syncTable.tips': '全てのテーブル構造をAIコンテキストに自動的に同期',
+  'chat.input.remain.tooltip': '手動で選択したテーブルはAIコンテキストに同期されます',
+  'chat.input.syncTable.tempTips': '🎉更新: 全てのテーブル構造をAIコンテキストに自動的に同期',
+
+  'chat.menu.create': '新しいチャットを作成',
+  'chat.menu.delete': '削除',
+  'chat.menu.delete.secondConfirm': 'この会話を削除してもよろしいですか？',
+  'chat.menu.noMore': '末尾です 🤐',
+  'chat.menu.empty.text': '会話はありません',
+  'chat.page.title': 'AIチャット',
+  'chat.page.empty.text': '新しいチャットを作成して始めましょう',
+  'chat.page.empty.button': '新しいチャットを作成',
+  'chat.page.empty.title': '新しいチャット',
+  'chat.page.welcome': '何をお手伝いしましょうか？',
+  'chat.dashborad.empty.text': '現在、適切なチャートに合うデータがありません。',
+
+  'chat.message.error': 'エラー：AIサービスに異常があります。もう一度試してください',
+  'chat.ai.common.think': 'Chat2DBは間違いを犯す可能性があります。重要な情報を確認することを検討してください',
+  'chat.ai.common.analyzingText': 'コード生成中...',
+  'chat.ai.common.analyzedText': 'コード生成完了',
+  'chat.ai.common.analyzingText.dashboard': 'ダッシュボード生成中...',
+  'chat.ai.common.analyzedText.dashboard': 'ダッシュボード生成完了',
+  'chat.ai.common.analyzingText.data': 'データ生成中...',
+  'chat.ai.common.analyzedText.data': 'データ生成完了',
+};
