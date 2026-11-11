@@ -1,0 +1,31 @@
+export default {
+  'chat.input.remain': 'Quedan {1}',
+  'chat.input.tableSelect.placeholder': 'Seleccione tablas',
+  'chat.input.tableSelect.error.TooManyTable': 'Solo puede seleccionar hasta 8 tablas',
+  'chat.input.remain.dialog.tips':
+    'Suscríbase a nuestra cuenta oficial de WeChat y envíe «promotion» para obtener más oportunidades de prueba.',
+  'chat.input.syncTable.tips': 'Sincroniza automáticamente todas las estructuras de tablas con el contexto de la IA',
+  'chat.input.remain.tooltip': 'La tabla seleccionada manualmente se sincronizará con el contexto de la IA',
+  'chat.input.syncTable.tempTips': '🎉 Novedad: sincronice automáticamente todas las estructuras de tablas con el contexto de la IA',
+
+  'chat.menu.create': 'Crear nuevo chat',
+  'chat.menu.delete': 'Eliminar',
+  'chat.menu.delete.secondConfirm': '¿Confirma que desea eliminar esta conversación?',
+  'chat.menu.noMore': 'No hay más',
+  'chat.menu.empty.text': 'No hay chats',
+  'chat.page.title': 'Chat con IA',
+  'chat.page.empty.text': 'Empiece creando un nuevo chat',
+  'chat.page.empty.button': 'Crear nuevo chat',
+  'chat.page.empty.title': 'Nuevo chat',
+  'chat.page.welcome': '¿En qué puedo ayudarle?',
+  'chat.dashborad.empty.text': 'Actualmente no hay datos coincidentes para los gráficos adecuados.',
+
+  'chat.message.error': 'Error: el servicio de IA no funciona correctamente. Vuelva a intentarlo',
+  'chat.ai.common.think': 'Chat2DB puede cometer errores. Compruebe la información importante',
+  'chat.ai.common.analyzingText': 'Analizando...',
+  'chat.ai.common.analyzedText': 'Analizado',
+  'chat.ai.common.analyzingText.dashboard': 'Analizando panel...',
+  'chat.ai.common.analyzedText.dashboard': 'Panel analizado',
+  'chat.ai.common.analyzingText.chart': 'Analizando gráfico...',
+  'chat.ai.common.analyzedText.chart': 'Gráfico analizado',
+};
