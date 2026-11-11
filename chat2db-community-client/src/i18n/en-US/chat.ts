@@ -1,0 +1,31 @@
+export default {
+  'chat.input.remain': '{1} remaining',
+  'chat.input.tableSelect.placeholder': 'Please choose tables',
+  'chat.input.tableSelect.error.TooManyTable': 'You can only select up to 8 tables',
+  'chat.input.remain.dialog.tips':
+    'Subscribe our official WeChat account, send promotion to get more chances to experience.',
+  'chat.input.syncTable.tips': 'The automatically synchronize all table structures to the AI context',
+  'chat.input.remain.tooltip': 'The manually selected table will be synchronized to the AI context',
+  'chat.input.syncTable.tempTips': '🎉Update: Automatically synchronize all table structures to the AI context',
+
+  'chat.menu.create': 'Create New Chat',
+  'chat.menu.delete': 'Delete',
+  'chat.menu.delete.secondConfirm': 'Are you sure you want to delete this conversation?',
+  'chat.menu.noMore': 'No More',
+  'chat.menu.empty.text': 'No Chat',
+  'chat.page.title': 'AI Chat',
+  'chat.page.empty.text': 'Start by creating a new chat',
+  'chat.page.empty.button': 'Create New Chat',
+  'chat.page.empty.title': 'New Chat',
+  'chat.page.welcome': 'What can I do for you?',
+  'chat.dashborad.empty.text': 'Currently, there is no matching data for the appropriate charts.',
+
+  'chat.message.error': 'Error: AI service is abnormal, please try again',
+  'chat.ai.common.think': 'Chat2DB can make mistakes. Consider checking important information',
+  'chat.ai.common.analyzingText': 'Analyzing...',
+  'chat.ai.common.analyzedText': 'Analyzed',
+  'chat.ai.common.analyzingText.dashboard': 'Analyzing Dashboard...',
+  'chat.ai.common.analyzedText.dashboard': 'Analyzed Dashboard',
+  'chat.ai.common.analyzingText.chart': 'Analyzing Chart...',
+  'chat.ai.common.analyzedText.chart': 'Analyzed Chart',
+};

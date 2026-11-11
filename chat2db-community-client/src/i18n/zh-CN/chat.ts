@@ -1,0 +1,31 @@
+export default {
+  'chat.input.remain': '剩余 {1} 次',
+  'chat.input.tableSelect.placeholder': '请选择表',
+  'chat.input.tableSelect.error.TooManyTable': '最多选择8张表',
+  'chat.input.remain.dialog.tips': '关注公众号，发送"推广"获取更多体验次数',
+  'chat.input.syncTable.tips':
+    '自动同步所有表结构给AI上下文（在群内联系群主，申请Chat2DBAI白名单后，仅在Chat2DBAI模型下可用）',
+  'chat.input.remain.tooltip': '手动选中的表的结构将会同步给AI上下文',
+  'chat.input.syncTable.tempTips': '🎉上线：自动同步所有表结构到AI上下文',
+
+  'chat.menu.create': '创建新聊天',
+  'chat.menu.delete': '删除',
+  'chat.menu.delete.secondConfirm': '确定要删除该会话吗？',
+  'chat.menu.noMore': '没有更多了 🤐',
+  'chat.menu.empty.text': '暂无对话',
+  'chat.page.title': 'AI 对话',
+  'chat.page.empty.text': '首先创建新聊天',
+  'chat.page.empty.button': '创建新聊天',
+  'chat.page.empty.title': '新的聊天',
+  'chat.page.welcome': '我能帮你做什么呢？',
+  'chat.dashborad.empty.text': '当前没有匹配上合适的图表数据',
+
+  'chat.message.error': 'Error: 服务异常，请重新尝试',
+  'chat.ai.common.think': 'Chat2DB可能会出错，请考虑核对重要信息',
+  'chat.ai.common.analyzingText': '代码生成中...',
+  'chat.ai.common.analyzedText': '代码生成完成',
+  'chat.ai.common.analyzingText.dashboard': '报表生成中...',
+  'chat.ai.common.analyzedText.dashboard': '报表生成完成',
+  'chat.ai.common.analyzingText.data': '数据查询中...',
+  'chat.ai.common.analyzedText.data': '数据查询完成',
+};

