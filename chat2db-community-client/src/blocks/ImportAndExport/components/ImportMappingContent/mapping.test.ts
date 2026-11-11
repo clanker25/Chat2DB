@@ -1,0 +1,88 @@
+import assert from 'node:assert/strict';
+import { ImportPreviewErrorCode, ImportUnmappedTarget, SKIP_IMPORT_SOURCE_FIELD } from '@/constants/importExport';
+import {
+  buildImportMappingRows,
+  buildInitialImportMapping,
+  getDuplicateImportMappings,
+  getRequiredUnmappedImportColumns,
+  getImportPreviewErrorMessage,
+} from './mapping';
+
+const mapping = buildInitialImportMapping(
+  ['name', 'email', 'extra_column'],
+  [
+    { sourceColumn: 'name', targetColumn: 'name' },
+    { sourceColumn: 'email', targetColumn: 'email' },
+  ],
+);
+
+assert.deepEqual(mapping, {
+  name: 'name',
+  email: 'email',
+  extra_column: SKIP_IMPORT_SOURCE_FIELD,
+});
+
+assert.deepEqual(
+  buildImportMappingRows(['name', 'extra_column'], [{ name: 'id' }, { name: 'name' }, { name: 'note' }], {
+    name: 'name',
+    extra_column: SKIP_IMPORT_SOURCE_FIELD,
+  }),
+  [
+    { key: 'source:name', kind: 'source', sourceColumn: 'name' },
+    { key: 'source:extra_column', kind: 'source', sourceColumn: 'extra_column' },
+    { key: 'target:id', kind: 'target', targetColumn: { name: 'id' } },
+    { key: 'target:note', kind: 'target', targetColumn: { name: 'note' } },
+  ],
+);
+
+assert.deepEqual(getDuplicateImportMappings({ ...mapping, extra_column: 'email' }), {
+  extra_column: {
+    sourceColumn: 'extra_column',
+    targetColumn: 'email',
+    mappedSource: 'email',
+  },
+});
+assert.deepEqual(getDuplicateImportMappings(mapping), {});
+assert.equal(
+  getImportPreviewErrorMessage({ errorMessage: 'Duplicate source column: name' }, 'Failed'),
+  'Duplicate source column: name',
+);
+assert.equal(getImportPreviewErrorMessage(new Error('Network unavailable'), 'Failed'), 'Network unavailable');
+assert.equal(getImportPreviewErrorMessage({ errorCode: 'SYSTEM_ERROR' }, 'Failed'), 'Failed');
+assert.equal(
+  getImportPreviewErrorMessage(
+    {
+      errorCode: ImportPreviewErrorCode.DUPLICATE_SOURCE_COLUMNS,
+      errorMessage: 'import.preview.duplicateSourceColumns : no message.',
+    },
+    'Failed',
+    { [ImportPreviewErrorCode.DUPLICATE_SOURCE_COLUMNS]: 'The import file contains duplicate source fields' },
+  ),
+  'The import file contains duplicate source fields',
+);
+
+// Specific parser diagnostics survive the shared display; missing backend text has a useful fallback.
+assert.equal(
+  getImportPreviewErrorMessage({ errorCode: 'import.preview.jsonEncodingMismatch',
+    errorMessage: 'JSON 无法按 UTF-8 编码读取，请检查上方的编码是否与文件一致。' }, '无法预览文件'),
+  'JSON 无法按 UTF-8 编码读取，请检查上方的编码是否与文件一致。',
+);
+assert.equal(
+  getImportPreviewErrorMessage({ errorCode: 'import.preview.parseFailed',
+    errorMessage: 'import.preview.parseFailed : no message.' }, '请检查文件内容和格式设置'),
+  '请检查文件内容和格式设置',
+);
+
+// Desktop IPC omits null properties; both transports must mark a missing default as required.
+const required = { name: 'name', nullable: false, autoIncrement: false };
+const withDefault = { name: 'amount', nullable: false, autoIncrement: false, defaultValue: '99.00' };
+const emptyDefault = { name: 'label', nullable: false, autoIncrement: false, defaultValue: '' };
+const columns = [required, withDefault, emptyDefault,
+  { name: 'id', nullable: false, autoIncrement: true }, { name: 'note', nullable: true, autoIncrement: false }];
+assert.deepEqual(getRequiredUnmappedImportColumns(columns, {}, ImportUnmappedTarget.DEFAULT), [required]);
+assert.deepEqual(getRequiredUnmappedImportColumns([{ ...required, defaultValue: null }], {},
+  ImportUnmappedTarget.DEFAULT).map(c => c.name), ['name']);
+assert.deepEqual(getRequiredUnmappedImportColumns(columns, { source: 'name' }, ImportUnmappedTarget.DEFAULT), []);
+assert.deepEqual(getRequiredUnmappedImportColumns(columns, {}, ImportUnmappedTarget.NULL),
+  [required, withDefault, emptyDefault]);
+assert.deepEqual(getDuplicateImportMappings({ a: '', b: '', c: SKIP_IMPORT_SOURCE_FIELD }), {});
