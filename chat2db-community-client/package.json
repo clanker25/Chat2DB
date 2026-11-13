@@ -158,7 +158,7 @@
     "mermaid": "^11.12.0",
     "monaco-editor": "^0.52.0",
     "node-schedule": "^2.1.1",
-    "pako": "^2.1.0",
+    "pako": "^3.0.3",
     "qrcode": "^1.5.3",
     "query-string": "^9.0.0",
     "rc-virtual-list": "^3.14.2",
